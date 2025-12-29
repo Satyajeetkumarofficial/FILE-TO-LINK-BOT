@@ -53,11 +53,11 @@ def unpack_new_file_id(new_file_id: str):
 @Client.on_message(filters.command(['batch']) & filters.create(allowed))
 async def gen_link_batch(bot, message: Message):
     if " " not in message.text:
-        return await message.reply("Use correct format.\nExample <code>/batch https://t.me/ProBotUpdate https://t.me/ProBotUpdate</code>.")
+        return await message.reply("Use correct format.\nExample <code>/batch https://t.me/ProBotUpdate/30 https://t.me/ProBotUpdate/40</code>.")
 
     links = message.text.strip().split(" ")
     if len(links) != 3:
-        return await message.reply("Use correct format.\nExample <code>/batch https://t.me/ProBotUpdate https://t.me/ProBotUpdate</code>.")
+        return await message.reply("Use correct format.\nExample <code>/batch https://t.me/ProBotUpdate/15 https://t.me/ProBotUpdate/22</code>.")
 
     cmd, first, last = links
     regex = re.compile(r"(https://)?(t\.me|telegram\.me|telegram\.dog)/(c/)?([\d\w_]+)/(\d+)")
