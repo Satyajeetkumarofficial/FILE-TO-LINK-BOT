@@ -46,11 +46,11 @@ DB_URL = environ.get('DATABASE_URI', "")
 DB_NAME = environ.get('DATABASE_NAME', "ProBotz")
 
 # 📸 __Media & Images__
-QR_CODE = environ.get('QR_CODE', 'https://ibb.co/mVkSySr7')
-VERIFY_IMG = environ.get("VERIFY_IMG", "https://ibb.co/mVkSySr7")
-AUTH_PICS = environ.get('AUTH_PICS', 'https://ibb.co/mVkSySr7')
-PICS = environ.get('PICS', 'https://ibb.co/mVkSySr7')
-FILE_PIC = environ.get('FILE_PIC', 'https://ibb.co/mVkSySr7')
+QR_CODE = environ.get('QR_CODE', 'https://ibb.co/h1DVpLfR')
+VERIFY_IMG = environ.get("VERIFY_IMG", "https://ibb.co/h1DVpLfR")
+AUTH_PICS = environ.get('AUTH_PICS', 'https://ibb.co/h1DVpLfR')
+PICS = environ.get('PICS', 'https://ibb.co/h1DVpLfR')
+FILE_PIC = environ.get('FILE_PIC', 'https://ibb.co/h1DVpLfR')
 
 # 📝 __Captions__
 FILE_CAPTION = environ.get('FILE_CAPTION', script.CAPTION)
@@ -62,7 +62,7 @@ PING_INTERVAL = int(environ.get("PING_INTERVAL", 1200))
 SLEEP_THRESHOLD = int(environ.get('SLEEP_THRESHOLD', 60))
 RATE_LIMIT_TIMEOUT = int(environ.get("RATE_LIMIT_TIMEOUT", 600))
 MAX_FILES = int(environ.get("MAX_FILES", 50))
-VERIFY_EXPIRE = int(environ.get('VERIFY_EXPIRE', 60))  # Hours
+VERIFY_EXPIRE = int(environ.get('VERIFY_EXPIRE', 90))  # Hours
 
 # ⚙️ __Worker & App Config__
 WORKERS = int(environ.get('WORKERS', 10))
@@ -73,7 +73,7 @@ NAME = environ.get('name', 'ProBotz')
 ON_HEROKU = 'DYNO' in environ
 APP_NAME = environ.get('APP_NAME') if ON_HEROKU else None
 
-PORT = int(environ.get('PORT', 2626))
+PORT = int(environ.get('PORT', 8080))
 NO_PORT = str(environ.get("NO_PORT", "true")).lower() in ("true", "1", "yes")
 HAS_SSL = str(environ.get("HAS_SSL", "true")).lower() in ("true", "1", "yes")
 
