@@ -141,7 +141,7 @@ async def cb_handler(client, query):
         await query.message.delete()
     elif query.data == "about":
         buttons = [[
-	    InlineKeyboardButton('💻', url='https://t.me/RexBots_Official')
+	    InlineKeyboardButton('💻', url='https://t.me/ProBotUpdate')
 	],[
             InlineKeyboardButton('• ʜᴏᴍᴇ •', callback_data='start'),
 	    InlineKeyboardButton('• ᴄʟᴏsᴇ •', callback_data='close_data')
@@ -349,7 +349,7 @@ async def delete_files_list(client, message):
 @Client.on_message(filters.command("about"))
 async def about(client, message):
     buttons = [[
-       InlineKeyboardButton('💻', url='https://t.me/RexBots_Official')
+       InlineKeyboardButton('💻', url='https://t.me/ProBotUpdate')
     ],[
        InlineKeyboardButton('• ᴄʟᴏsᴇ •', callback_data='close_data')
     ]]
