@@ -2,7 +2,7 @@ from os import environ, getenv
 from Script import script
 
 # 🚀 __Bot Configuration__
-SESSION = environ.get('SESSION', 'RexBots')  # Session name
+SESSION = environ.get('SESSION', 'ProBotz')  # Session name
 API_ID = int(environ.get('API_ID', ''))
 API_HASH = environ.get('API_HASH', '')
 BOT_TOKEN = environ.get('BOT_TOKEN', '')
@@ -10,14 +10,14 @@ BOT_TOKEN = environ.get('BOT_TOKEN', '')
 # 👑 __Owner & Admins__
 ADMINS = [int(i) for i in environ.get('ADMINS', '').split()]
 AUTH_CHANNEL = [int(i) for i in environ.get("AUTH_CHANNEL", "").split()]
-OWNER_USERNAME = environ.get("OWNER_USERNAME", 'RexBots_Official')
-BOT_USERNAME = environ.get("BOT_USERNAME", 'RexBots_Official')
+OWNER_USERNAME = environ.get("OWNER_USERNAME", 'SatyajeetKumarOfficial')
+BOT_USERNAME = environ.get("BOT_USERNAME", 'QuickFile2LinkProBot')
 
 # 🔗 __Channel & Support Links__
-CHANNEL = environ.get('CHANNEL', 'https://t.me/RexBots_Official')
-SUPPORT = environ.get('SUPPORT', 'https://t.me/RexBots_Official')
-HOW_TO_VERIFY = environ.get('HOW_TO_VERIFY', 'https://t.me/RexBots_Official')
-HOW_TO_OPEN = environ.get('HOW_TO_OPEN', 'https://t.me/RexBots_Official')
+CHANNEL = environ.get('CHANNEL', 'https://t.me/ProBotXUpdate')
+SUPPORT = environ.get('SUPPORT', 'https://t.me/ProBotUpdate')
+HOW_TO_VERIFY = environ.get('HOW_TO_VERIFY', 'https://t.me/ProBotUpdate')
+HOW_TO_OPEN = environ.get('HOW_TO_OPEN', 'https://t.me/ProBotUpdate')
 
 # 📢 __Log Channels__
 BIN_CHANNEL = int(environ.get("BIN_CHANNEL", ''))
@@ -43,7 +43,7 @@ SHORTLINK_API = environ.get('SHORTLINK_API', '')
 
 # 💾 __Database Configuration__
 DB_URL = environ.get('DATABASE_URI', "")
-DB_NAME = environ.get('DATABASE_NAME', "rexlinkbot")
+DB_NAME = environ.get('DATABASE_NAME', "ProBotz")
 
 # 📸 __Media & Images__
 QR_CODE = environ.get('QR_CODE', 'https://ibb.co/mVkSySr7')
@@ -67,7 +67,7 @@ VERIFY_EXPIRE = int(environ.get('VERIFY_EXPIRE', 60))  # Hours
 # ⚙️ __Worker & App Config__
 WORKERS = int(environ.get('WORKERS', 10))
 MULTI_CLIENT = False
-NAME = environ.get('name', 'rexbots_official')
+NAME = environ.get('name', 'ProBotz')
 
 # 🌐 __Web Server__
 ON_HEROKU = 'DYNO' in environ
