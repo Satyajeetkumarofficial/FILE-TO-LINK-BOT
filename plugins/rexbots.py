@@ -25,7 +25,7 @@ async def is_user_joined(bot, message: Message) -> bool:
                         text = (
                             "<i>🔒 Bᴏᴛ ɪs ɴᴏᴛ ᴀɴ ᴀᴅᴍɪɴ ɪɴ ᴛʜɪs ᴄʜᴀɴɴᴇʟ.\n"
                             "Pʟᴇᴀsᴇ ᴄᴏɴᴛᴀᴄᴛ ᴛʜᴇ ᴅᴇᴠᴇʟᴏᴘᴇʀ:</i> "
-                            "<b><a href='https://t.me/RexBots_Official'>[ ᴄʟɪᴄᴋ ʜᴇʀᴇ ]</a></b>"
+                            "<b><a href='https://t.me/SatyajeetKumarOfficial'>[ ᴄʟɪᴄᴋ ʜᴇʀᴇ ]</a></b>"
                         ),
                         parse_mode=ParseMode.HTML,
                         disable_web_page_preview=True
