@@ -1,6 +1,7 @@
 import os
 from pyrogram import Client, filters
 from pyrogram.types import Message
+from pyrogram.enums import ParseMode
 from info import * 
 
 BYPASS_IDS = ADMINS + AUTH_CHANNEL + [BIN_CHANNEL, LOG_CHANNEL, PREMIUM_LOGS, VERIFIED_LOG]
@@ -15,8 +16,8 @@ async def maintenance_checker(client, message: Message):
     "Please try again later.\n\n"
     'Support Group: <a href="https://t.me/ProBotsDiscussionsGroup">➜ Open Chat</a>',
     quote=True,
-    parse_mode="html"
-        )
+    parse_mode=ParseMode.HTML
+)
         return
 
     await message.continue_propagation()
