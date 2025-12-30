@@ -40,8 +40,9 @@ async def start(client, message):
         reply_markup = InlineKeyboardMarkup(buttons)
         await message.reply_photo(
             photo=PICS,
-            caption=script.START_TXT.format(message.from_user.mention, BOT_USERNAME),
-            reply_markup=reply_markup
+            caption=script.START_TXT.format(message.from_user.mention, me2),
+            reply_markup=reply_markup,
+			parse_mode=enums.ParseMode.HTML
         )
         return
 
