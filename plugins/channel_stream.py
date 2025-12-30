@@ -1,6 +1,6 @@
 import asyncio
 from web.utils.file_properties import get_hash
-from pyrogram import Client, filters, enums
+from pyrogram import Client, filters
 from info import (
     BIN_CHANNEL, URL, BOT_USERNAME,
     IS_SHORTLINK, HOW_TO_OPEN, NO_STREAM_CHANNELS
@@ -33,7 +33,7 @@ async def channel_receive_handler(bot: Client, broadcast: Message):
                 await bot.leave_chat(chat_id)
                 return
 
-        # ───── Forward file to BIN ─────
+        # ───── Forward file to BIN_CHANNEL ─────
         msg = await broadcast.forward(chat_id=BIN_CHANNEL)
 
         # ───── Streaming control ─────
@@ -55,7 +55,7 @@ async def channel_receive_handler(bot: Client, broadcast: Message):
             download = raw_download
             file_link = raw_file_link
 
-        # ───── Buttons (ONLY if streaming enabled) ─────
+        # ───── Build buttons (ONLY if streaming enabled) ─────
         buttons_list = []
 
         if not stream_disabled:
@@ -73,13 +73,16 @@ async def channel_receive_handler(bot: Client, broadcast: Message):
 
         buttons = InlineKeyboardMarkup(buttons_list) if buttons_list else None
 
-        # ✅ IMPORTANT: caption NOT touched at all
-        if buttons:
-            await bot.edit_message_reply_markup(
-                chat_id=broadcast.chat.id,
-                message_id=broadcast.id,
-                reply_markup=buttons
-            )
+        # ───── IMPORTANT: Caption NOT touched ─────
+        if buttons is not None:
+            try:
+                await bot.edit_message_reply_markup(
+                    chat_id=broadcast.chat.id,
+                    message_id=broadcast.id,
+                    reply_markup=buttons
+                )
+            except:
+                pass
 
     except asyncio.exceptions.TimeoutError:
         await asyncio.sleep(5)
@@ -89,9 +92,13 @@ async def channel_receive_handler(bot: Client, broadcast: Message):
         await asyncio.sleep(w.value)
 
     except Exception as e:
-        await bot.send_message(
-            chat_id=BIN_CHANNEL,
-            text=f"❌ **Error:** `{e}`",
-            disable_web_page_preview=True
-        )
+        try:
+            if str(e).strip():
+                await bot.send_message(
+                    chat_id=BIN_CHANNEL,
+                    text=f"❌ **Error:** `{e}`",
+                    disable_web_page_preview=True
+                )
+        except:
+            pass
         print(f"❌ Can't edit channel message! Error: {e}")
