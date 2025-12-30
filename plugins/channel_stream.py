@@ -1,15 +1,11 @@
 import asyncio
-import os
-import random
 from web.utils.file_properties import get_hash
 from pyrogram import Client, filters, enums
 from info import (
-    BIN_CHANNEL, URL, CHANNEL, BOT_USERNAME,
-    IS_SHORTLINK, CHANNEL_FILE_CAPTION,
-    HOW_TO_OPEN, NO_STREAM_CHANNELS
+    BIN_CHANNEL, URL, BOT_USERNAME,
+    IS_SHORTLINK, HOW_TO_OPEN, NO_STREAM_CHANNELS
 )
-from utils import get_size, get_shortlink
-from Script import script
+from utils import get_shortlink
 from database.users_db import db
 from pyrogram.errors import FloodWait
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
@@ -25,24 +21,19 @@ async def channel_receive_handler(bot: Client, broadcast: Message):
 
         # ───── Channel ban check ─────
         if str(chat_id).startswith("-100"):
-            is_banned = await db.is_channel_blocked(chat_id)
-            if is_banned:
+            if await db.is_channel_blocked(chat_id):
                 try:
                     await bot.send_message(
                         chat_id,
                         "🚫 **This channel is banned from using the bot.**\n\n"
-                        "🔄 **Contact admin if you think this is a mistake.**\n\n"
-                        "@ProBotUpdate"
+                        "🔄 **Contact admin if you think this is a mistake.**"
                     )
                 except:
                     pass
                 await bot.leave_chat(chat_id)
                 return
 
-        # ───── File handling ─────
-        file = broadcast.document or broadcast.video
-        file_name = file.file_name if file else "Unknown File"
-
+        # ───── Forward file to BIN ─────
         msg = await broadcast.forward(chat_id=BIN_CHANNEL)
 
         # ───── Streaming control ─────
@@ -64,19 +55,6 @@ async def channel_receive_handler(bot: Client, broadcast: Message):
             download = raw_download
             file_link = raw_file_link
 
-        # ───── Log message ─────
-        await msg.reply_text(
-            text=(
-                f"**Channel Name:** `{broadcast.chat.title}`\n"
-                f"**CHANNEL ID:** `{broadcast.chat.id}`\n"
-                f"**Request URL:** {download}"
-            ),
-            quote=True
-        )
-
-        # ───── Caption ─────
-        new_caption = CHANNEL_FILE_CAPTION.format(CHANNEL, file_name)
-
         # ───── Buttons (ONLY if streaming enabled) ─────
         buttons_list = []
 
@@ -85,11 +63,9 @@ async def channel_receive_handler(bot: Client, broadcast: Message):
                 InlineKeyboardButton(" ꜱᴛʀᴇᴀᴍ ", url=stream),
                 InlineKeyboardButton(" ᴅᴏᴡɴʟᴏᴀᴅ ", url=download)
             ])
-
             buttons_list.append([
                 InlineKeyboardButton(" ᴄʜᴇᴄᴋ ʜᴇʀᴇ ᴛᴏ ɢᴇᴛ ғɪʟᴇ ", url=file_link)
             ])
-
             if IS_SHORTLINK:
                 buttons_list.append([
                     InlineKeyboardButton("• ʜᴏᴡ ᴛᴏ ᴏᴘᴇɴ •", url=HOW_TO_OPEN)
@@ -97,15 +73,14 @@ async def channel_receive_handler(bot: Client, broadcast: Message):
 
         buttons = InlineKeyboardMarkup(buttons_list) if buttons_list else None
 
-        await bot.edit_message_caption(
-            chat_id=broadcast.chat.id,
-            message_id=broadcast.id,
-            caption=new_caption,
-            reply_markup=buttons,
-            parse_mode=enums.ParseMode.HTML
-        )
+        # ✅ IMPORTANT: caption NOT touched at all
+        if buttons:
+            await bot.edit_message_reply_markup(
+                chat_id=broadcast.chat.id,
+                message_id=broadcast.id,
+                reply_markup=buttons
+            )
 
-    # ───── Error handling ─────
     except asyncio.exceptions.TimeoutError:
         await asyncio.sleep(5)
         await channel_receive_handler(bot, broadcast)
