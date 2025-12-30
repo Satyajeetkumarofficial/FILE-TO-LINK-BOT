@@ -7,6 +7,9 @@ API_ID = int(environ.get('API_ID', ''))
 API_HASH = environ.get('API_HASH', '')
 BOT_TOKEN = environ.get('BOT_TOKEN', '')
 
+# 🚫 __Non Streaming Channels__
+NO_STREAM_CHANNELS = [int(i) for i in environ.get("NO_STREAM_CHANNELS", "-1002269651634, -1001887894502").replace(",", " ").split()]
+
 # 👑 __Owner & Admins__
 ADMINS = [int(i) for i in environ.get('ADMINS', '7413682152').split()]
 AUTH_CHANNEL = [int(i) for i in environ.get("AUTH_CHANNEL", "-1002269651634").replace(",", " ").split()]
