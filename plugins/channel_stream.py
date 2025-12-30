@@ -26,7 +26,7 @@ async def channel_receive_handler(bot: Client, broadcast: Message):
                     await bot.send_message(
                         chat_id,
                         "🚫 **This channel is banned from using the bot.**\n\n"
-                        "🔄 **Contact admin if you think this is a mistake.**"
+                        "🔄 **Cᴏɴᴛᴀᴄᴛ ᴀᴅᴍɪɴ ɪғ ʏᴏᴜ ᴛʜɪɴᴋ ᴛʜɪꜱ ɪꜱ ᴀ ᴍɪꜱᴛᴀᴋᴇ.**\n\n@ProBotUpdate"
                     )
                 except:
                     pass
