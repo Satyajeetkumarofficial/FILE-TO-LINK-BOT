@@ -9,7 +9,7 @@ BOT_TOKEN = environ.get('BOT_TOKEN', '')
 
 # 👑 __Owner & Admins__
 ADMINS = [int(i) for i in environ.get('ADMINS', '').split()]
-AUTH_CHANNEL = [int(i) for i in environ.get("AUTH_CHANNEL", "").split()]
+AUTH_CHANNEL = [int(i) for i in environ.get("AUTH_CHANNEL", "-1002269651634").split()]
 OWNER_USERNAME = environ.get("OWNER_USERNAME", 'SatyajeetKumarOfficial')
 BOT_USERNAME = environ.get("BOT_USERNAME", 'QuickFile2LinkProBot')
 
