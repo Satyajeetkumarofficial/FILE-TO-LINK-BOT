@@ -1,6 +1,6 @@
 class script(object):
-    START_TXT = """<b>👋 Hey {},</b>\n\n🤖 I’m {me.mention} 🚀\n📤 Just send me any <b>file or video</b> and I’ll instantly generate 🔗 <b>direct download</b> & 🎬 <b>streaming links</b> ⚡\n\n➕ You can also add me as an <b>admin</b> to your channel\n📢 I’ll automatically create links for every media you post\n🔘 With ready-to-use buttons for smooth access ✨\n\n📢 <a href="https://t.me/ProBotXUpdate">➜ Join Update Channel</a>"""
-
+    START_TXT = """<b>👋 Hey {},</b>\n\n🤖 I’m <b>{}</b> 🚀 — just send me any <b>file or video</b> 📤 and I’ll instantly convert it into 🔗 <b>direct download</b> & 🎬 <b>smooth streaming links</b> ⚡ with fast processing and reliable access.\n\n➕ You can also add me as an <b>admin</b> to your channel 📢 and I’ll automatically create download & stream links with ready-to-use buttons for every media you post ✨ making sharing easy and seamless.\n\n📢 <a href="https://t.me/ProBotXUpdate">➜ Join Update Channel</a>"""
+    
     RESTART_TXT = """\n<b>Bᴏᴛ Rᴇsᴛᴀʀᴛᴇᴅ !\n\n📅 Dᴀᴛᴇ : <code>{}</code>\n⏰ Tɪᴍᴇ : <code>{}</code>\n🌐 Tɪᴍᴇᴢᴏɴᴇ : <code>Asia/Kolkata</code>\n🛠️ Bᴜɪʟᴅ Sᴛᴀᴛᴜs: <code>v4.6.00 [ Sᴛᴀʙʟᴇ ]</code></b>"""
 
     HELP_TXT = """<blockquote><b>You don't need many commands to use this bot\n\nJust send me files and I will give you direct download & streaming link\n\nAlso you can use me in your channel just add me and make me admin and see my power 💥\n\nFor more, use /help command\nMore, use /about command</b></blockquote>"""
