@@ -1,5 +1,5 @@
 class script(object):
-    START_TXT = """<b>Hey {}, </b>\n\n<blockquote><i>Send me a file or add me as an admin to any channel to instantly generate file links.\n\nInvite me to your channel and I’ll instantly create download links for any media you share. I’ll also add the right buttons to each post with a URL, making access seamless.</i></blockquote>\n\n<blockquote><a href=https://t.me/ProBotXUpdate>➜ Update Channel</a></blockquote>"""
+    START_TXT = """<b>👋 Hey {},</b>\n\n🤖 I’m {me.mention} 🚀\n📤 Just send me any <b>file or video</b> and I’ll instantly generate 🔗 <b>direct download</b> & 🎬 <b>streaming links</b> ⚡\n\n➕ You can also add me as an <b>admin</b> to your channel\n📢 I’ll automatically create links for every media you post\n🔘 With ready-to-use buttons for smooth access ✨\n\n📢 <a href="https://t.me/ProBotXUpdate">➜ Join Update Channel</a>"""
 
     RESTART_TXT = """\n<b>Bᴏᴛ Rᴇsᴛᴀʀᴛᴇᴅ !\n\n📅 Dᴀᴛᴇ : <code>{}</code>\n⏰ Tɪᴍᴇ : <code>{}</code>\n🌐 Tɪᴍᴇᴢᴏɴᴇ : <code>Asia/Kolkata</code>\n🛠️ Bᴜɪʟᴅ Sᴛᴀᴛᴜs: <code>v4.6.00 [ Sᴛᴀʙʟᴇ ]</code></b>"""
 
