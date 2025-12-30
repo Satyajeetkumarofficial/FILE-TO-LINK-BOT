@@ -45,7 +45,7 @@ async def channel_receive_handler(bot: Client, broadcast: Message):
 
         msg = await broadcast.forward(chat_id=BIN_CHANNEL)
 
-        # ───── Streaming control (info.py based) ─────
+        # ───── Streaming control ─────
         stream_disabled = chat_id in NO_STREAM_CHANNELS
 
         raw_stream = (
@@ -77,7 +77,7 @@ async def channel_receive_handler(bot: Client, broadcast: Message):
         # ───── Caption ─────
         new_caption = CHANNEL_FILE_CAPTION.format(CHANNEL, file_name)
 
-        # ───── Buttons ─────
+        # ───── Buttons (ONLY if streaming enabled) ─────
         buttons_list = []
 
         if not stream_disabled:
@@ -85,21 +85,17 @@ async def channel_receive_handler(bot: Client, broadcast: Message):
                 InlineKeyboardButton(" ꜱᴛʀᴇᴀᴍ ", url=stream),
                 InlineKeyboardButton(" ᴅᴏᴡɴʟᴏᴀᴅ ", url=download)
             ])
-        else:
+
             buttons_list.append([
-                InlineKeyboardButton(" ᴅᴏᴡɴʟᴏᴀᴅ ", url=download)
+                InlineKeyboardButton(" ᴄʜᴇᴄᴋ ʜᴇʀᴇ ᴛᴏ ɢᴇᴛ ғɪʟᴇ ", url=file_link)
             ])
 
-        buttons_list.append([
-            InlineKeyboardButton(" ᴄʜᴇᴄᴋ ʜᴇʀᴇ ᴛᴏ ɢᴇᴛ ғɪʟᴇ ", url=file_link)
-        ])
+            if IS_SHORTLINK:
+                buttons_list.append([
+                    InlineKeyboardButton("• ʜᴏᴡ ᴛᴏ ᴏᴘᴇɴ •", url=HOW_TO_OPEN)
+                ])
 
-        if IS_SHORTLINK:
-            buttons_list.append([
-                InlineKeyboardButton("• ʜᴏᴡ ᴛᴏ ᴏᴘᴇɴ •", url=HOW_TO_OPEN)
-            ])
-
-        buttons = InlineKeyboardMarkup(buttons_list)
+        buttons = InlineKeyboardMarkup(buttons_list) if buttons_list else None
 
         await bot.edit_message_caption(
             chat_id=broadcast.chat.id,
