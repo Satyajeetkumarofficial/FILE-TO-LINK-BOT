@@ -1,4 +1,4 @@
-import re, math, logging, secrets, time
+import re, math, logging, secrets, time, mimetypes
 from aiohttp import web
 from aiohttp.http_exceptions import BadStatusLine
 from info import *
@@ -12,11 +12,6 @@ from web.utils.render_template import render_page
 
 routes = web.RouteTableDef()
 class_cache = {}
-
-# 🔐 STREAM LIMIT (Telegram free safe)
-ACTIVE_STREAMS = set()
-MAX_STREAMS = 2
-
 
 @routes.get("/", allow_head=True)
 async def root_route_handler(_):
@@ -34,7 +29,6 @@ async def root_route_handler(_):
         "version": __version__,
     })
 
-
 @routes.get(r"/watch/{path:\S+}", allow_head=True)
 async def stream_watch_handler(request: web.Request):
     try:
@@ -47,22 +41,18 @@ async def stream_watch_handler(request: web.Request):
             id = int(re.search(r"(\d+)(?:\/\S+)?", path).group(1))
             secure_hash = request.rel_url.query.get("hash")
 
+        # 🕒 Link Expiry Check
         expiry_seconds = await db.get_link_expiry()
         if expiry_seconds > 0:
             file_record = await db.files.find_one({"file_id": id})
             if file_record:
                 created_at = file_record.get("timestamp", 0)
                 if time.time() - created_at > expiry_seconds:
-                    return web.Response(
-                        status=410,
-                        text="🚫 This link has expired.\nPlease request a new link from the bot."
-                    )
+                    return web.Response(status=410, text="🚫 This link has expired.\nPlease request a new link from the bot.")
 
         return web.Response(
-            text=await render_page(id, secure_hash),
-            content_type="text/html"
+            text=await render_page(id, secure_hash), content_type="text/html"
         )
-
     except InvalidHash as e:
         raise web.HTTPForbidden(text=e.message)
     except FIleNotFound as e:
@@ -72,7 +62,6 @@ async def stream_watch_handler(request: web.Request):
     except Exception as e:
         logging.critical(e)
         return web.Response(status=500, text=str(e))
-
 
 @routes.get(r"/{path:\S+}", allow_head=True)
 async def stream_handler(request: web.Request):
@@ -86,19 +75,16 @@ async def stream_handler(request: web.Request):
             id = int(re.search(r"(\d+)(?:\/\S+)?", path).group(1))
             secure_hash = request.rel_url.query.get("hash")
 
+        # 🕒 Link Expiry Check
         expiry_seconds = await db.get_link_expiry()
         if expiry_seconds > 0:
             file_record = await db.files.find_one({"file_id": id})
             if file_record:
                 created_at = file_record.get("timestamp", 0)
                 if time.time() - created_at > expiry_seconds:
-                    return web.Response(
-                        status=410,
-                        text="🚫 This link has expired.\nPlease request a new link from the bot."
-                    )
+                    return web.Response(status=410, text="🚫 This link has expired.\nPlease request a new link from the bot.")
 
         return await media_streamer(request, id, secure_hash)
-
     except InvalidHash as e:
         raise web.HTTPForbidden(text=e.message)
     except FIleNotFound as e:
@@ -109,26 +95,14 @@ async def stream_handler(request: web.Request):
         logging.critical(e)
         return web.Response(status=500, text=str(e))
 
-
 async def media_streamer(request: web.Request, id: int, secure_hash: str):
-    range_header = request.headers.get("Range")
-    accept = request.headers.get("Accept", "")
-
-    # ✅ FIXED: real stream detection
-    is_stream = bool(range_header and accept.startswith("video"))
-
-    # 🔒 Stream limit (ONLY for real streaming)
-    stream_key = str(id)
-    if is_stream:
-        if len(ACTIVE_STREAMS) >= MAX_STREAMS:
-            return web.Response(
-                status=429,
-                text="⏳ Streaming slots full. Please try again later."
-            )
-        ACTIVE_STREAMS.add(stream_key)
+    range_header = request.headers.get("Range", None)
 
     index = min(work_loads, key=work_loads.get)
     faster_client = multi_clients[index]
+
+    if MULTI_CLIENT:
+        logging.info(f"📡 Client {index} is now serving: {request.remote}")
 
     tg_connect = class_cache.get(faster_client) or ByteStreamer(faster_client)
     class_cache[faster_client] = tg_connect
@@ -141,13 +115,17 @@ async def media_streamer(request: web.Request, id: int, secure_hash: str):
     file_size = file_id.file_size
 
     if range_header:
-        match = re.match(r"bytes=(\d+)-(\d*)", range_header)
-        from_bytes = int(match.group(1))
-        until_bytes = int(match.group(2)) if match.group(2) else file_size - 1
+        try:
+            match = re.match(r"bytes=(\d+)-(\d*)", range_header)
+            from_bytes = int(match.group(1))
+            until_bytes = int(match.group(2)) if match.group(2) else file_size - 1
+        except Exception:
+            return web.Response(status=400, text="Invalid Range header")
     else:
         from_bytes = 0
         until_bytes = file_size - 1
 
+    # Validate range
     if until_bytes >= file_size or from_bytes < 0 or until_bytes < from_bytes:
         return web.Response(
             status=416,
@@ -155,12 +133,8 @@ async def media_streamer(request: web.Request, id: int, secure_hash: str):
             headers={"Content-Range": f"bytes */{file_size}"}
         )
 
-    # ⚙️ STREAM vs DOWNLOAD OPTIMIZATION
-    if is_stream:
-        chunk_size = 256 * 1024   # streaming
-    else:
-        chunk_size = 1024 * 1024  # download (1MB)
-
+    # Setup stream vars
+    chunk_size = 1024 * 1024
     offset = from_bytes - (from_bytes % chunk_size)
     first_part_cut = from_bytes - offset
     last_part_cut = until_bytes % chunk_size + 1
@@ -172,16 +146,13 @@ async def media_streamer(request: web.Request, id: int, secure_hash: str):
 
     response = web.StreamResponse(
         status=206 if range_header else 200,
+        reason="Partial Content" if range_header else "OK",
         headers={
             "Content-Type": mime_type,
             "Content-Length": str(req_length),
             "Content-Range": f"bytes {from_bytes}-{until_bytes}/{file_size}",
+            "Content-Disposition": f'inline; filename="{file_name}"',
             "Accept-Ranges": "bytes",
-            "Content-Disposition": (
-                f'inline; filename="{file_name}"'
-                if is_stream else
-                f'attachment; filename="{file_name}"'
-            ),
         }
     )
 
@@ -189,21 +160,13 @@ async def media_streamer(request: web.Request, id: int, secure_hash: str):
 
     try:
         async for chunk in tg_connect.yield_file(
-            file_id, index, offset,
-            first_part_cut, last_part_cut,
-            part_count, chunk_size
+            file_id, index, offset, first_part_cut, last_part_cut, part_count, chunk_size
         ):
             await response.write(chunk)
-
-    except Exception:
-        pass  # client disconnected / cancelled
-
+    except Exception as e:
+        logging.exception(f"Error streaming file {file_id.file_unique_id}: {e}")
     finally:
-        if is_stream:
-            ACTIVE_STREAMS.discard(stream_key)
-        try:
-            await response.write_eof()
-        except Exception:
-            pass
+        await response.write_eof()
 
     return response
+        
