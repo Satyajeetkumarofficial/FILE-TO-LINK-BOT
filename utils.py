@@ -36,6 +36,28 @@ async def ping_server():
             logger.error(f"❌ Exception while pinging server: {e}")
             traceback.print_exc()
 
+# -------------------------- LINK EXPIRY FORMATTER -------------------------- #
+def format_link_expiry(seconds: int) -> str:
+    """
+    Convert link expiry seconds into human readable text
+    """
+    if not seconds or seconds <= 0:
+        return "Never ❌"
+
+    minutes, sec = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    days, hours = divmod(hours, 24)
+
+    parts = []
+    if days:
+        parts.append(f"{days} day{'s' if days > 1 else ''}")
+    if hours:
+        parts.append(f"{hours} hour{'s' if hours > 1 else ''}")
+    if minutes:
+        parts.append(f"{minutes} minute{'s' if minutes > 1 else ''}")
+
+    return "⏳ " + ", ".join(parts)
+
 # -------------------------- FILE SIZE CONVERTER -------------------------- #
 def get_size(size: int) -> str:
     """Converts bytes to human-readable format."""
@@ -168,3 +190,4 @@ async def check_verification(bot, userid):
         return False
         
     return True
+    
