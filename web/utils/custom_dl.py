@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import time
 from info import *
 from typing import Dict, Union
 from web.server import work_loads
@@ -132,18 +131,11 @@ class ByteStreamer:
         last_part_cut: int,
         part_count: int,
         chunk_size: int,
-    ) -> Union[str, None]:
+    ) -> Union[bytes, None]:
 
         client = self.client
         work_loads[index] += 1
         media_session = await self.generate_media_session(client, file_id)
-
-        # ✅ Respect chunk_size from route, only safety floor
-        if chunk_size < 128 * 1024:
-            chunk_size = 128 * 1024
-
-        start_time = time.time()
-        MAX_TIME = 30 * 60  # extreme failsafe only
 
         current_part = 1
         location = await self.get_location(file_id)
@@ -159,12 +151,6 @@ class ByteStreamer:
 
             if isinstance(r, raw.types.upload.File):
                 while True:
-
-                    # ⛔ failsafe, almost never triggers
-                    if time.time() - start_time > MAX_TIME and part_count > 10:
-                        logging.debug("Failsafe break for extremely long transfer")
-                        break
-
                     chunk = r.bytes
                     if not chunk:
                         break
