@@ -22,7 +22,6 @@ class ByteStreamer:
     async def get_file_properties(self, id: int) -> FileId:
         if id not in self.cached_file_ids:
             await self.generate_file_properties(id)
-            logging.debug(f"Cached file properties for message with ID {id}")
         return self.cached_file_ids[id]
 
     async def generate_file_properties(self, id: int) -> FileId:
@@ -30,7 +29,7 @@ class ByteStreamer:
         if not file_id:
             raise FIleNotFound
         self.cached_file_ids[id] = file_id
-        return self.cached_file_ids[id]
+        return file_id
 
     async def generate_media_session(self, client: Client, file_id: FileId) -> Session:
         media_session = client.media_sessions.get(file_id.dc_id)
@@ -135,16 +134,19 @@ class ByteStreamer:
         chunk_size: int,
     ) -> Union[str, None]:
 
-        # ✅ SAFE SPEED ENFORCEMENT
-        if chunk_size < 512 * 1024:
-            chunk_size = 512 * 1024  # 512KB minimum
-
-        start_time = time.time()
-        MAX_TIME = 20 * 60  # 20 minutes
-
         client = self.client
         work_loads[index] += 1
         media_session = await self.generate_media_session(client, file_id)
+
+        # 🔍 Detect streaming vs download
+        is_stream = chunk_size <= 256 * 1024
+
+        # ✅ Enforce minimum ONLY for download
+        if not is_stream and chunk_size < 512 * 1024:
+            chunk_size = 512 * 1024
+
+        start_time = time.time()
+        MAX_TIME = 20 * 60  # download safety only
 
         current_part = 1
         location = await self.get_location(file_id)
@@ -160,8 +162,9 @@ class ByteStreamer:
 
             if isinstance(r, raw.types.upload.File):
                 while True:
-                    # 🔒 TELEGRAM THROTTLE GUARD
-                    if time.time() - start_time > MAX_TIME:
+
+                    # ⛔ Break ONLY long downloads, not streaming
+                    if not is_stream and time.time() - start_time > MAX_TIME:
                         logging.debug("Breaking long download to avoid Telegram throttling")
                         break
 
@@ -193,7 +196,7 @@ class ByteStreamer:
                     )
 
         except (TimeoutError, AttributeError) as e:
-            logging.debug(f"Download interrupted: {e}")
+            logging.debug(f"Transfer interrupted: {e}")
 
         finally:
             work_loads[index] -= 1
