@@ -5,7 +5,7 @@ from pyrogram.errors import FloodWait
 from info import URL, BOT_USERNAME, BIN_CHANNEL, CHANNEL, PROTECT_CONTENT, FSUB, MAX_FILES
 from database.users_db import db
 from web.utils.file_properties import get_hash
-from utils import get_size
+from utils import get_size, format_link_expiry
 from plugins.rexbots import rx_verification, is_user_allowed, is_user_joined
 from Script import script
 
@@ -44,6 +44,10 @@ async def private_receive_handler(c: Client, m: Message):
     if not verified:
         return
 
+    # 🔹 Get link expiry from DB
+    expiry_seconds = await db.get_link_expiry()
+    expiry_text = format_link_expiry(expiry_seconds)
+
     try:
         forwarded = await m.forward(chat_id=BIN_CHANNEL)
         hash_str = get_hash(forwarded)
@@ -69,7 +73,7 @@ async def private_receive_handler(c: Client, m: Message):
         )
 
         await m.reply_text(
-            script.CAPTION_TXT.format(CHANNEL, file_name, file_size, stream, download),
+            script.CAPTION_TXT.format(CHANNEL, file_name, file_size, stream, download, expiry_text),
             disable_web_page_preview=True,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton(" 🖥️ ꜱᴛʀᴇᴀᴍ ", url=stream),
@@ -81,3 +85,4 @@ async def private_receive_handler(c: Client, m: Message):
     except FloodWait as e:
         await asyncio.sleep(e.value)
         await c.send_message(BIN_CHANNEL, f"⚠️ FloodWait: {e.value}s from {m.from_user.first_name}")
+        
