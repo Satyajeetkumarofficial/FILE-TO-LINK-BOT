@@ -138,15 +138,12 @@ class ByteStreamer:
         work_loads[index] += 1
         media_session = await self.generate_media_session(client, file_id)
 
-        # 🔍 Detect streaming vs download
-        is_stream = chunk_size <= 256 * 1024
-
-        # ✅ Enforce minimum ONLY for download
-        if not is_stream and chunk_size < 512 * 1024:
-            chunk_size = 512 * 1024
+        # ✅ Respect chunk_size from route, only safety floor
+        if chunk_size < 128 * 1024:
+            chunk_size = 128 * 1024
 
         start_time = time.time()
-        MAX_TIME = 20 * 60  # download safety only
+        MAX_TIME = 30 * 60  # extreme failsafe only
 
         current_part = 1
         location = await self.get_location(file_id)
@@ -163,9 +160,9 @@ class ByteStreamer:
             if isinstance(r, raw.types.upload.File):
                 while True:
 
-                    # ⛔ Break ONLY long downloads, not streaming
-                    if not is_stream and time.time() - start_time > MAX_TIME:
-                        logging.debug("Breaking long download to avoid Telegram throttling")
+                    # ⛔ failsafe, almost never triggers
+                    if time.time() - start_time > MAX_TIME and part_count > 10:
+                        logging.debug("Failsafe break for extremely long transfer")
                         break
 
                     chunk = r.bytes
@@ -195,7 +192,7 @@ class ByteStreamer:
                         )
                     )
 
-        except (TimeoutError, AttributeError) as e:
+        except Exception as e:
             logging.debug(f"Transfer interrupted: {e}")
 
         finally:
