@@ -17,7 +17,7 @@ class script(object):
 
     AUTH_TXT = """<i><b>Hᴇʏ {}! 👋\n\nTᴏ ᴄᴏɴᴛɪɴᴜᴇ ᴜsɪɴɢ ᴛʜɪs ʙᴏᴛ, ᴘʟᴇᴀsᴇ ᴊᴏɪɴ ᴏᴜʀ ᴜᴘᴅᴀᴛᴇs ᴄʜᴀɴɴᴇʟ 💬\n\nSᴇʀᴠᴇʀ ʟᴏᴀᴅ ɪs ʜɪɡʜ, sᴏ ᴀᴄᴄᴇss ɪs ʟɪᴍɪᴛᴇᴅ ᴛᴏ ᴏᴜʀ ᴄʜᴀɴɴᴇʟ ᴍᴇᴍʙᴇʀs ᴏɴʟʏ 🚀</b></i>"""
 
-    CAPTION_TXT = """\n<i><u>Your Link Generated !</u></i>\n\n<blockquote><b>📧 File Name :- </b> <i><a href={}>{}</a></i>\n\n<b>📦 File Size :- </b> <i>{}</i>\n\n<b><u><i>Tap To Copy Link 👇</i></u></b>\n\n<b>🖥 Stream  : </b> <code>{}</code>\n\n<b>📥 Download : </b> <code>{}</code>\n\n<b>🚸 Any issues dm : https://t.me/ProBotUpdate</b></blockquote>"""
+    CAPTION_TXT = """\n<i><u>Your Link Generated !</u></i>\n\n<blockquote><b>📧 File Name :- </b> <i><a href={}>{}</a></i>\n\n<b>📦 File Size :- </b> <i>{}</i>\n\n<b><u><i>Tap To Copy Link 👇</i></u></b>\n\n<b>🖥 Stream  : </b> <code>{}</code>\n\n<b>📥 Download : </b> <code>{}</code>\n\n<b>⏳ Link Expiry :- </b> <i>{}</i>\n\n<b>🚸 Any issues dm : https://t.me/ProBotUpdate</b></blockquote>"""
 
     VERIFICATION_TEXT = """<b>👋 ʜᴇʏ {},\n\n📌 <u>ʏᴏᴜ ᴀʀᴇ ɴᴏᴛ ᴠᴇʀɪꜰɪᴇᴅ ᴛᴏᴅᴀʏ, ᴛᴀᴘ ᴏɴ ᴛʜᴇ ᴠᴇʀɪꜰʏ ʟɪɴᴋ & ɢᴇᴛ ᴜɴʟɪᴍɪᴛᴇᴅ ᴀᴄᴄᴇss ꜰᴏʀ ɴᴇxᴛ ꜰᴜʟʟ ᴅᴀʏ.</u></b>"""
     
