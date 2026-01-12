@@ -2,16 +2,16 @@ import os, sys, glob, pytz, asyncio, logging, importlib
 from pathlib import Path
 
 from pyrogram import idle
-import pyrogram.utils
+import pyrogram.utils  # Import pyrogram.utils explicitly
 
-# ---------------- EVENT LOOP FIX (SAFE & CLEAN) ----------------
+# ================= EVENT LOOP FIX (FINAL & SAFE) =================
 # Python 3.10+ compatible, no DeprecationWarning
 try:
     loop = asyncio.get_running_loop()
 except RuntimeError:
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-# ---------------------------------------------------------------
+# ================================================================
 
 # Patch pyrogram.utils.get_peer_type to handle newer peer IDs
 def get_peer_type_new(peer_id: int) -> str:
@@ -23,6 +23,7 @@ def get_peer_type_new(peer_id: int) -> str:
     else:
         return "chat"
 
+# Apply the patch
 pyrogram.utils.get_peer_type = get_peer_type_new
 pyrogram.utils.MIN_CHANNEL_ID = -1002822095763
 
@@ -49,19 +50,21 @@ files = glob.glob(ppath)
 StreamBot.start()
 
 async def start():
-    print("\nInitializing Your Bot")
+    print("\n")
+    print("Initalizing Your Bot")
 
     await initialize_clients()
 
     for name in files:
         patt = Path(name)
-        plugin_name = patt.stem
+        plugin_name = patt.stem.replace(".py", "")
+        plugins_dir = Path(f"plugins/{plugin_name}.py")
         import_path = f"plugins.{plugin_name}"
-        spec = importlib.util.spec_from_file_location(import_path, patt)
+        spec = importlib.util.spec_from_file_location(import_path, plugins_dir)
         load = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(load)
         sys.modules[import_path] = load
-        print("Imported =>", plugin_name)
+        print("Imported => " + plugin_name)
 
     if ON_HEROKU:
         asyncio.create_task(ping_server())
@@ -79,10 +82,17 @@ async def start():
 
     StreamBot.loop.create_task(check_expired_premium(StreamBot))
 
-    await StreamBot.send_message(LOG_CHANNEL, script.RESTART_TXT.format(today, time))
-    await StreamBot.send_message(ADMINS[0], "<b>ʙᴏᴛ ʀᴇsᴛᴀʀᴛᴇᴅ !!</b>")
     await StreamBot.send_message(
-        SUPPORT_GROUP, f"<b>{me.mention} ʀᴇsᴛᴀʀᴛᴇᴅ 🤖</b>"
+        chat_id=LOG_CHANNEL,
+        text=script.RESTART_TXT.format(today, time)
+    )
+    await StreamBot.send_message(
+        chat_id=ADMINS[0],
+        text="<b>ʙᴏᴛ ʀᴇsᴛᴀʀᴛᴇᴅ !!</b>"
+    )
+    await StreamBot.send_message(
+        chat_id=SUPPORT_GROUP,
+        text=f"<b>{me.mention} ʀᴇsᴛᴀʀᴛᴇᴅ 🤖</b>"
     )
 
     app = web.AppRunner(await web_server())
@@ -95,4 +105,4 @@ if __name__ == "__main__":
     try:
         loop.run_until_complete(start())
     except KeyboardInterrupt:
-        logging.info("----------- Service Stopped -----------")
+        logging.info("----------------------- Service Stopped -----------------------")
