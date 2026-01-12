@@ -112,10 +112,13 @@ async def stream_handler(request: web.Request):
 
 async def media_streamer(request: web.Request, id: int, secure_hash: str):
     range_header = request.headers.get("Range")
-    is_stream = bool(range_header)
+    accept = request.headers.get("Accept", "")
 
-    # 🔒 Stream limit
-    stream_key = f"{request.remote}-{id}"
+    # ✅ FIXED: real stream detection
+    is_stream = bool(range_header and accept.startswith("video"))
+
+    # 🔒 Stream limit (ONLY for real streaming)
+    stream_key = str(id)
     if is_stream:
         if len(ACTIVE_STREAMS) >= MAX_STREAMS:
             return web.Response(
@@ -154,9 +157,9 @@ async def media_streamer(request: web.Request, id: int, secure_hash: str):
 
     # ⚙️ STREAM vs DOWNLOAD OPTIMIZATION
     if is_stream:
-        chunk_size = 256 * 1024   # 256KB → best for streaming
+        chunk_size = 256 * 1024   # streaming
     else:
-        chunk_size = 512 * 1024   # 512KB → best for download
+        chunk_size = 1024 * 1024  # download (1MB)
 
     offset = from_bytes - (from_bytes % chunk_size)
     first_part_cut = from_bytes - offset
@@ -192,12 +195,15 @@ async def media_streamer(request: web.Request, id: int, secure_hash: str):
         ):
             await response.write(chunk)
 
-    except Exception as e:
-        logging.exception(f"Streaming error: {e}")
+    except Exception:
+        pass  # client disconnected / cancelled
 
     finally:
         if is_stream:
             ACTIVE_STREAMS.discard(stream_key)
-        await response.write_eof()
+        try:
+            await response.write_eof()
+        except Exception:
+            pass
 
     return response
