@@ -69,7 +69,7 @@ VERIFY_EXPIRE = int(environ.get('VERIFY_EXPIRE', 90))  # Hours
 
 # ⚙️ __Worker & App Config__
 WORKERS = int(environ.get('WORKERS', 10))
-MULTI_CLIENT = False
+MULTI_CLIENT = True
 NAME = environ.get('name', 'ProBotz')
 
 # 🌐 __Web Server__
