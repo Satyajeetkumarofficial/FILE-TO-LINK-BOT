@@ -11,6 +11,39 @@ from web.server.exceptions import FIleNotFound
 from pyrogram.file_id import FileId, FileType, ThumbnailSource
 
 
+# --------------------------------------------------------------------------
+# Patch: serialize Session.restart() per Session instance.
+#
+# Pyrogram's own internals (the recv_worker / send() error handling) call
+# session.restart() automatically, as a fire-and-forget background task,
+# whenever the underlying TCP connection drops (e.g. "Connection lost",
+# "Broken pipe"). When several concurrent streams share one media Session
+# for a DC and the connection dies, more than one of these internal
+# restarts can fire for the *same* Session object at the same time. Two
+# concurrent restarts both call stop() -> await recv_task while a fresh
+# recv_worker is already waiting on the socket, producing:
+#   RuntimeError: read() called while another coroutine is already
+#   waiting for incoming data
+# This happens inside Pyrogram's own code, not ours, so no amount of
+# try/except in our streaming code can catch it. Wrapping restart() with
+# a per-instance lock ensures at most one restart runs at a time for a
+# given session, regardless of who triggers it.
+# --------------------------------------------------------------------------
+_original_session_restart = Session.restart
+
+
+async def _locked_session_restart(self, *args, **kwargs):
+    lock = self.__dict__.get("_custom_restart_lock")
+    if lock is None:
+        lock = asyncio.Lock()
+        self.__dict__["_custom_restart_lock"] = lock
+    async with lock:
+        return await _original_session_restart(self, *args, **kwargs)
+
+
+Session.restart = _locked_session_restart
+
+
 class ByteStreamer:
     def __init__(self, client: Client):
         """A custom class that holds the cache of a specific client and class functions.
@@ -188,6 +221,13 @@ class ByteStreamer:
             )
         return location
 
+    # How many GetFile requests to keep in flight at once per stream.
+    # Higher = more throughput (multiple 1MB chunks requested in parallel
+    # instead of one round-trip at a time), but too high can trigger
+    # Telegram flood limits on very slow/free hosts. 4-6 is a safe,
+    # noticeably faster default; tune via PREFETCH_WINDOW in info.py if needed.
+    PREFETCH_WINDOW = int(globals().get("PREFETCH_WINDOW", 5))
+
     async def yield_file(
         self,
         file_id: FileId,
@@ -202,46 +242,61 @@ class ByteStreamer:
         Custom generator that yields the bytes of the media file.
         Modded from <https://github.com/eyaadh/megadlbot_oss/blob/master/mega/telegram/utils/custom_download.py#L20>
         Thanks to Eyaadh <https://github.com/eyaadh>
+
+        Speed note: instead of awaiting one GetFile round-trip at a time
+        (request -> wait -> request -> wait ...), this keeps a sliding
+        window of several requests in flight concurrently and yields the
+        results strictly in order. Chunks still arrive to the client in the
+        correct sequence, but network round-trip latency is hidden behind
+        the parallel in-flight requests, which noticeably raises effective
+        throughput per stream.
         """
         client = self.client
         work_loads[index] += 1
         logging.debug(f"Starting to yielding file with client {index}.")
         media_session = await self.generate_media_session(client, file_id)
-
-        current_part = 1
         location = await self.get_location(file_id)
 
-        try:
+        offsets = [offset + i * chunk_size for i in range(part_count)]
+        window = max(1, self.PREFETCH_WINDOW)
+
+        async def fetch(off: int) -> bytes:
             r = await media_session.send(
-                raw.functions.upload.GetFile(
-                    location=location, offset=offset, limit=chunk_size
-                ),
+                raw.functions.upload.GetFile(location=location, offset=off, limit=chunk_size)
             )
-            if isinstance(r, raw.types.upload.File):
-                while True:
-                    chunk = r.bytes
-                    if not chunk:
-                        break
-                    elif part_count == 1:
-                        yield chunk[first_part_cut:last_part_cut]
-                    elif current_part == 1:
-                        yield chunk[first_part_cut:]
-                    elif current_part == part_count:
-                        yield chunk[:last_part_cut]
-                    else:
-                        yield chunk
+            return r.bytes if isinstance(r, raw.types.upload.File) else b""
 
-                    current_part += 1
-                    offset += chunk_size
+        pending: Dict[int, asyncio.Task] = {}
+        next_to_fetch = 0
+        next_to_yield = 0
 
-                    if current_part > part_count:
-                        break
+        def _fill_pipeline():
+            nonlocal next_to_fetch
+            while next_to_fetch < len(offsets) and len(pending) < window:
+                pending[next_to_fetch] = asyncio.create_task(fetch(offsets[next_to_fetch]))
+                next_to_fetch += 1
 
-                    r = await media_session.send(
-                        raw.functions.upload.GetFile(
-                            location=location, offset=offset, limit=chunk_size
-                        ),
-                    )
+        try:
+            _fill_pipeline()
+            while next_to_yield < len(offsets):
+                task = pending.pop(next_to_yield)
+                chunk = await task
+                _fill_pipeline()
+
+                if not chunk:
+                    break
+
+                current_part = next_to_yield + 1
+                if part_count == 1:
+                    yield chunk[first_part_cut:last_part_cut]
+                elif current_part == 1:
+                    yield chunk[first_part_cut:]
+                elif current_part == part_count:
+                    yield chunk[:last_part_cut]
+                else:
+                    yield chunk
+
+                next_to_yield += 1
         except (TimeoutError, AttributeError):
             pass
         except (ConnectionError, OSError, RuntimeError) as e:
@@ -252,7 +307,9 @@ class ByteStreamer:
             logging.warning(f"Media session for DC {file_id.dc_id} appears broken, dropping it: {e}")
             await self._drop_media_session(client, file_id.dc_id)
         finally:
-            logging.debug(f"Finished yielding file with {current_part} parts.")
+            for t in pending.values():
+                t.cancel()
+            logging.debug(f"Finished yielding file, served up to part {next_to_yield}.")
             work_loads[index] -= 1
 
     async def clean_cache(self) -> None:
@@ -264,4 +321,4 @@ class ByteStreamer:
             self.cached_file_ids.clear()
             logging.debug("Cleaned the cache")
 
-            
+        
