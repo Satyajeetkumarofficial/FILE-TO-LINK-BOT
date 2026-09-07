@@ -307,8 +307,10 @@ class ByteStreamer:
             logging.warning(f"Media session for DC {file_id.dc_id} appears broken, dropping it: {e}")
             await self._drop_media_session(client, file_id.dc_id)
         finally:
-            for t in pending.values():
-                t.cancel()
+            if pending:
+                for t in pending.values():
+                    t.cancel()
+                await asyncio.gather(*pending.values(), return_exceptions=True)
             logging.debug(f"Finished yielding file, served up to part {next_to_yield}.")
             work_loads[index] -= 1
 
@@ -410,6 +412,7 @@ async def parallel_yield_file(
         streamer = _get_byte_streamer(client)
         idx = _client_index(client)
         work_loads[idx] = work_loads.get(idx, 0) + 1
+        pending: Dict[int, asyncio.Task] = {}
         try:
             file_id = await streamer.get_file_properties(id)
             location = await streamer.get_location(file_id)
@@ -423,7 +426,6 @@ async def parallel_yield_file(
                 )
                 return r.bytes if isinstance(r, raw.types.upload.File) else b""
 
-            pending: Dict[int, asyncio.Task] = {}
             next_to_fetch = 0
             next_to_put = 0
 
@@ -452,6 +454,10 @@ async def parallel_yield_file(
             except Exception:
                 logging.debug("Could not drop broken session for failed worker", exc_info=True)
         finally:
+            if pending:
+                for t in pending.values():
+                    t.cancel()
+                await asyncio.gather(*pending.values(), return_exceptions=True)
             await q.put(None)  # sentinel: this worker's output is finished
             work_loads[idx] = max(0, work_loads.get(idx, 1) - 1)
 
