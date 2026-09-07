@@ -30,6 +30,9 @@ class ByteStreamer:
         self.clean_timer = 30 * 60
         self.client: Client = client
         self.cached_file_ids: Dict[int, FileId] = {}
+        # One lock per DC so concurrent requests for the same file/DC can't
+        # race to create/restart the media session at the same time.
+        self._session_locks: Dict[int, asyncio.Lock] = {}
         asyncio.create_task(self.clean_cache())
 
     async def get_file_properties(self, id: int) -> FileId:
@@ -61,57 +64,82 @@ class ByteStreamer:
         """
         Generates the media session for the DC that contains the media file.
         This is required for getting the bytes from Telegram servers.
+
+        Guarded by a per-DC lock: without this, several concurrent Range
+        requests (e.g. a video player buffering) can all see no cached
+        session at once and each start a brand new Session/recv_worker for
+        the same DC. The losing sessions never get stopped, and a later
+        restart on one of them races with a recv_worker that's still
+        blocked reading on the old connection, producing:
+        "RuntimeError: read() called while another coroutine is already
+        waiting for incoming data".
         """
+        lock = self._session_locks.setdefault(file_id.dc_id, asyncio.Lock())
 
-        media_session = client.media_sessions.get(file_id.dc_id, None)
+        async with lock:
+            media_session = client.media_sessions.get(file_id.dc_id, None)
 
-        if media_session is None:
-            if file_id.dc_id != await client.storage.dc_id():
-                media_session = Session(
-                    client,
-                    file_id.dc_id,
-                    await Auth(
-                        client, file_id.dc_id, await client.storage.test_mode()
-                    ).create(),
-                    await client.storage.test_mode(),
-                    is_media=True,
-                )
-                await media_session.start()
-
-                for _ in range(6):
-                    exported_auth = await client.invoke(
-                        raw.functions.auth.ExportAuthorization(dc_id=file_id.dc_id)
+            if media_session is None:
+                if file_id.dc_id != await client.storage.dc_id():
+                    media_session = Session(
+                        client,
+                        file_id.dc_id,
+                        await Auth(
+                            client, file_id.dc_id, await client.storage.test_mode()
+                        ).create(),
+                        await client.storage.test_mode(),
+                        is_media=True,
                     )
+                    await media_session.start()
 
-                    try:
-                        await media_session.send(
-                            raw.functions.auth.ImportAuthorization(
-                                id=exported_auth.id, bytes=exported_auth.bytes
+                    for _ in range(6):
+                        exported_auth = await client.invoke(
+                            raw.functions.auth.ExportAuthorization(dc_id=file_id.dc_id)
+                        )
+
+                        try:
+                            await media_session.send(
+                                raw.functions.auth.ImportAuthorization(
+                                    id=exported_auth.id, bytes=exported_auth.bytes
+                                )
                             )
-                        )
-                        break
-                    except AuthBytesInvalid:
-                        logging.debug(
-                            f"Invalid authorization bytes for DC {file_id.dc_id}"
-                        )
-                        continue
+                            break
+                        except AuthBytesInvalid:
+                            logging.debug(
+                                f"Invalid authorization bytes for DC {file_id.dc_id}"
+                            )
+                            continue
+                    else:
+                        await media_session.stop()
+                        raise AuthBytesInvalid
                 else:
-                    await media_session.stop()
-                    raise AuthBytesInvalid
+                    media_session = Session(
+                        client,
+                        file_id.dc_id,
+                        await client.storage.auth_key(),
+                        await client.storage.test_mode(),
+                        is_media=True,
+                    )
+                    await media_session.start()
+                logging.debug(f"Created media session for DC {file_id.dc_id}")
+                client.media_sessions[file_id.dc_id] = media_session
             else:
-                media_session = Session(
-                    client,
-                    file_id.dc_id,
-                    await client.storage.auth_key(),
-                    await client.storage.test_mode(),
-                    is_media=True,
-                )
-                await media_session.start()
-            logging.debug(f"Created media session for DC {file_id.dc_id}")
-            client.media_sessions[file_id.dc_id] = media_session
-        else:
-            logging.debug(f"Using cached media session for DC {file_id.dc_id}")
-        return media_session
+                logging.debug(f"Using cached media session for DC {file_id.dc_id}")
+            return media_session
+
+    async def _drop_media_session(self, client: Client, dc_id: int) -> None:
+        """
+        Removes a broken media session so the next request builds a fresh
+        one, instead of every subsequent request reusing a dead connection.
+        """
+        lock = self._session_locks.setdefault(dc_id, asyncio.Lock())
+        async with lock:
+            session = client.media_sessions.pop(dc_id, None)
+            if session is not None:
+                try:
+                    await session.stop()
+                except Exception:
+                    logging.debug(f"Error while stopping broken session for DC {dc_id}", exc_info=True)
 
     @staticmethod
     async def get_location(file_id: FileId) -> Union[
@@ -216,8 +244,15 @@ class ByteStreamer:
                     )
         except (TimeoutError, AttributeError):
             pass
+        except (ConnectionError, OSError, RuntimeError) as e:
+            # The underlying connection/session is in a bad state (e.g. the
+            # "read() called while another coroutine is already waiting"
+            # race, or a dropped socket). Drop it so the next request
+            # rebuilds a fresh session instead of reusing a dead one.
+            logging.warning(f"Media session for DC {file_id.dc_id} appears broken, dropping it: {e}")
+            await self._drop_media_session(client, file_id.dc_id)
         finally:
-            logging.debug("Finished yielding file with {current_part} parts.")
+            logging.debug(f"Finished yielding file with {current_part} parts.")
             work_loads[index] -= 1
 
     async def clean_cache(self) -> None:
@@ -228,4 +263,5 @@ class ByteStreamer:
             await asyncio.sleep(self.clean_timer)
             self.cached_file_ids.clear()
             logging.debug("Cleaned the cache")
-                        
+
+            
