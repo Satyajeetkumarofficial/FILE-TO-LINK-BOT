@@ -2,7 +2,7 @@ import asyncio
 import logging
 from info import *
 from typing import Dict, Union
-from web.server import work_loads
+from web.server import work_loads, multi_clients
 from pyrogram import Client, utils, raw
 from .file_properties import get_file_ids
 from pyrogram.session import Session, Auth
@@ -226,7 +226,7 @@ class ByteStreamer:
     # instead of one round-trip at a time), but too high can trigger
     # Telegram flood limits on very slow/free hosts. 4-6 is a safe,
     # noticeably faster default; tune via PREFETCH_WINDOW in info.py if needed.
-    PREFETCH_WINDOW = int(globals().get("PREFETCH_WINDOW", 8))
+    PREFETCH_WINDOW = int(globals().get("PREFETCH_WINDOW", 5))
 
     async def yield_file(
         self,
@@ -321,4 +321,164 @@ class ByteStreamer:
             self.cached_file_ids.clear()
             logging.debug("Cleaned the cache")
 
-        
+
+# ==========================================================================
+# Multi-client parallel streaming
+#
+# yield_file() above pipelines multiple chunk requests on ONE client's
+# connection. That helps hide round-trip latency, but it's still capped by
+# whatever throughput a single Telegram bot session/connection can push.
+#
+# parallel_yield_file() goes a step further: it splits the requested byte
+# range into contiguous groups and fetches each group over a DIFFERENT
+# client (a different bot account = a different TCP connection to
+# Telegram), all running concurrently. Each group is still internally
+# pipelined. Results are streamed back to the caller strictly in order via
+# small per-worker queues, so playback/download starts immediately and
+# workers 2..N keep fetching ahead in the background while worker 1's
+# output is being sent to the browser.
+#
+# This only helps when a single connection's speed is the bottleneck (not
+# when the server's own outbound bandwidth is the limit).
+# ==========================================================================
+
+# How many client connections to use in parallel for one stream.
+# Bounded by however many bot accounts (multi-clients) are configured.
+MAX_PARALLEL_CLIENTS = int(globals().get("MAX_PARALLEL_CLIENTS", 4))
+
+_byte_streamer_cache: Dict[Client, "ByteStreamer"] = {}
+
+
+def _get_byte_streamer(client: Client) -> "ByteStreamer":
+    streamer = _byte_streamer_cache.get(client)
+    if streamer is None:
+        streamer = ByteStreamer(client)
+        _byte_streamer_cache[client] = streamer
+    return streamer
+
+
+async def parallel_yield_file(
+    primary_index: int,
+    primary_file_id: FileId,
+    id: int,
+    offset: int,
+    first_part_cut: int,
+    last_part_cut: int,
+    part_count: int,
+    chunk_size: int,
+):
+    """
+    Splits [offset, offset + part_count*chunk_size) across several client
+    connections and streams the results back in the correct order.
+    Falls back to effectively the same behaviour as yield_file() when only
+    one client is configured.
+    """
+    ordered_clients = [multi_clients[primary_index]] + [
+        c for i, c in multi_clients.items() if i != primary_index
+    ]
+
+    n_workers = max(1, min(MAX_PARALLEL_CLIENTS, len(ordered_clients), part_count))
+    workers_clients = ordered_clients[:n_workers]
+
+    # Avoid making the primary client re-fetch file properties it (or the
+    # caller) already looked up moments ago.
+    primary_streamer = _get_byte_streamer(workers_clients[0])
+    primary_streamer.cached_file_ids[id] = primary_file_id
+
+    # Split part indices [0, part_count) into n_workers contiguous groups.
+    base, rem = divmod(part_count, n_workers)
+    groups = []
+    start = 0
+    for w in range(n_workers):
+        size = base + (1 if w < rem else 0)
+        if size == 0:
+            continue
+        groups.append((start, start + size))
+        start += size
+
+    window = max(1, ByteStreamer.PREFETCH_WINDOW)
+    queues = [asyncio.Queue(maxsize=window) for _ in groups]
+
+    def _client_index(client: Client) -> int:
+        for i, c in multi_clients.items():
+            if c is client:
+                return i
+        return primary_index
+
+    async def producer(qi: int, client: Client, start_part: int, end_part: int):
+        q = queues[qi]
+        streamer = _get_byte_streamer(client)
+        idx = _client_index(client)
+        work_loads[idx] = work_loads.get(idx, 0) + 1
+        try:
+            file_id = await streamer.get_file_properties(id)
+            location = await streamer.get_location(file_id)
+            media_session = await streamer.generate_media_session(client, file_id)
+
+            part_offsets = [offset + i * chunk_size for i in range(start_part, end_part)]
+
+            async def fetch(off: int) -> bytes:
+                r = await media_session.send(
+                    raw.functions.upload.GetFile(location=location, offset=off, limit=chunk_size)
+                )
+                return r.bytes if isinstance(r, raw.types.upload.File) else b""
+
+            pending: Dict[int, asyncio.Task] = {}
+            next_to_fetch = 0
+            next_to_put = 0
+
+            def _fill():
+                nonlocal next_to_fetch
+                while next_to_fetch < len(part_offsets) and len(pending) < window:
+                    pending[next_to_fetch] = asyncio.create_task(fetch(part_offsets[next_to_fetch]))
+                    next_to_fetch += 1
+
+            _fill()
+            while next_to_put < len(part_offsets):
+                task = pending.pop(next_to_put)
+                chunk = await task
+                _fill()
+                await q.put(chunk)
+                if not chunk:
+                    break
+                next_to_put += 1
+        except (TimeoutError, AttributeError):
+            pass
+        except (ConnectionError, OSError, RuntimeError) as e:
+            logging.warning(f"Parallel worker (client {idx}) failed: {e}")
+            try:
+                fid = await streamer.get_file_properties(id)
+                await streamer._drop_media_session(client, fid.dc_id)
+            except Exception:
+                logging.debug("Could not drop broken session for failed worker", exc_info=True)
+        finally:
+            await q.put(None)  # sentinel: this worker's output is finished
+            work_loads[idx] = max(0, work_loads.get(idx, 1) - 1)
+
+    producer_tasks = [
+        asyncio.create_task(producer(i, workers_clients[i], g[0], g[1]))
+        for i, g in enumerate(groups)
+    ]
+
+    try:
+        global_part = 0
+        for qi in range(len(groups)):
+            q = queues[qi]
+            while True:
+                chunk = await q.get()
+                if chunk is None:
+                    break
+                if not chunk:
+                    return
+                if part_count == 1:
+                    yield chunk[first_part_cut:last_part_cut]
+                elif global_part == 0:
+                    yield chunk[first_part_cut:]
+                elif global_part == part_count - 1:
+                    yield chunk[:last_part_cut]
+                else:
+                    yield chunk
+                global_part += 1
+    finally:
+        for t in producer_tasks:
+            t.cancel()
