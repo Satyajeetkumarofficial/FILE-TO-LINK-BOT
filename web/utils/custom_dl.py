@@ -226,7 +226,7 @@ class ByteStreamer:
     # instead of one round-trip at a time), but too high can trigger
     # Telegram flood limits on very slow/free hosts. 4-6 is a safe,
     # noticeably faster default; tune via PREFETCH_WINDOW in info.py if needed.
-    PREFETCH_WINDOW = int(globals().get("PREFETCH_WINDOW", 5))
+    PREFETCH_WINDOW = int(globals().get("PREFETCH_WINDOW", 8))
 
     async def yield_file(
         self,
