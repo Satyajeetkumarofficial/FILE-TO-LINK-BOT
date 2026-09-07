@@ -5,7 +5,7 @@ from info import *
 from web.server import multi_clients, work_loads, StreamBot
 from web.server.exceptions import FIleNotFound, InvalidHash
 from database.users_db import db
-from web.utils.custom_dl import ByteStreamer, parallel_yield_file
+from web.utils.custom_dl import ByteStreamer
 from utils import get_readable_time
 from web.utils import StartTime, __version__
 from web.utils.render_template import render_page
@@ -159,8 +159,8 @@ async def media_streamer(request: web.Request, id: int, secure_hash: str):
     await response.prepare(request)
 
     try:
-        async for chunk in parallel_yield_file(
-            index, file_id, id, offset, first_part_cut, last_part_cut, part_count, chunk_size
+        async for chunk in tg_connect.yield_file(
+            file_id, index, offset, first_part_cut, last_part_cut, part_count, chunk_size
         ):
             await response.write(chunk)
     except Exception as e:
@@ -169,5 +169,4 @@ async def media_streamer(request: web.Request, id: int, secure_hash: str):
         await response.write_eof()
 
     return response
-
-            
+        
