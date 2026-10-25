@@ -119,8 +119,8 @@ async def start(client, message):
                     protect_content=BATCH_PROTECT_CONTENT
                 )
             except FloodWait as e:
-                await asyncio.sleep(getattr(e, 'value', None) or getattr(e, 'x', 5))
-                logger.warning(f"⏳ FloodWait: {getattr(e, 'value', None) or getattr(e, 'x', 5)}s")
+                await asyncio.sleep(e.x)
+                logger.warning(f"⏳ FloodWait: {e.x}s")
                 await client.send_cached_media(
                     chat_id=message.from_user.id,
                     file_id=msg.get("file_id"),
