@@ -21,7 +21,7 @@ Design goals: stable speed, no half-sent files, many simultaneous users.
 import asyncio
 import logging
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from contextlib import suppress
 from typing import Dict, List, Optional
 
@@ -30,10 +30,13 @@ from info import (
     FETCH_RETRIES,
     FETCH_TIMEOUT,
     FILE_CACHE_SIZE,
+    FLOOD_BUDGET,
     MAX_FLOOD_SLEEP,
     MAX_INFLIGHT_CHUNKS,
     MAX_PARALLEL_CLIENTS,
+    MAX_REQUESTS_PER_CLIENT,
     MIN_PARTS_PER_WORKER,
+    MIN_REQUESTS_PER_CLIENT,
     PREFETCH_WINDOW,
 )
 from web.server import work_loads, multi_clients
@@ -125,6 +128,74 @@ def pick_client_index() -> int:
 
 
 # ============================================================================
+# Per-bot request gate (adaptive): protects a bot from FLOOD_WAIT storms
+# ============================================================================
+class _Gate:
+    """
+    * limits simultaneous GetFile calls of ONE bot (AIMD: halves on FloodWait,
+      +1 after every 25 successes, between MIN and MAX_REQUESTS_PER_CLIENT)
+    * on FloodWait pauses ALL requests of that bot until the wait is over, so
+      dozens of lanes do not retry at the same instant (thundering herd).
+    """
+
+    def __init__(self):
+        self.limit = MAX_REQUESTS_PER_CLIENT
+        self.inflight = 0
+        self.paused_until = 0.0
+        self._ok = 0
+        self._last_cut = 0.0
+        self._waiters: deque = deque()
+
+    def _wake(self):
+        room = max(1, self.limit - self.inflight)
+        while self._waiters and room > 0:
+            w = self._waiters.popleft()
+            if not w.done():
+                w.set_result(None)
+                room -= 1
+
+    async def acquire(self):
+        loop = asyncio.get_running_loop()
+        while True:
+            now = time.monotonic()
+            if now >= self.paused_until and self.inflight < self.limit:
+                self.inflight += 1
+                return
+            fut = loop.create_future()
+            self._waiters.append(fut)
+            timeout = (self.paused_until - now) if now < self.paused_until else None
+            try:
+                await asyncio.wait_for(fut, timeout)
+            except asyncio.TimeoutError:
+                pass
+            finally:
+                with suppress(ValueError):
+                    self._waiters.remove(fut)
+
+    def release(self):
+        self.inflight = max(0, self.inflight - 1)
+        self._wake()
+
+    def success(self):
+        self._ok += 1
+        if self._ok >= 25 and self.limit < MAX_REQUESTS_PER_CLIENT:
+            self.limit += 1
+            self._ok = 0
+            self._wake()
+
+    def flood(self, seconds: float) -> bool:
+        """Register a FloodWait. Returns True when this is a NEW event (for logging)."""
+        now = time.monotonic()
+        new_event = now >= self.paused_until
+        self.paused_until = max(self.paused_until, now + seconds + 0.2)
+        if now - self._last_cut > 2:
+            self.limit = max(MIN_REQUESTS_PER_CLIENT, int(self.limit * 0.6))
+            self._last_cut = now
+            self._ok = 0
+        return new_event
+
+
+# ============================================================================
 # ByteStreamer: per-client cache of file properties + media sessions
 # ============================================================================
 class ByteStreamer:
@@ -133,6 +204,7 @@ class ByteStreamer:
         self._props: "OrderedDict[int, tuple]" = OrderedDict()  # id -> (ts, FileId)
         self._inflight: Dict[int, asyncio.Task] = {}
         self._session_locks: Dict[int, asyncio.Lock] = {}
+        self.gate = _Gate()
 
     # ---------------------------------------------------------------- props
     def _cache_get(self, id: int) -> Optional[FileId]:
@@ -342,8 +414,13 @@ class _Lane:
         )
 
     async def _fetch(self, off: int) -> bytes:
+        gate = self.streamer.gate
         last: Optional[BaseException] = None
-        for attempt in range(FETCH_RETRIES):
+        attempt = 0
+        flood_left = FLOOD_BUDGET
+        while attempt < FETCH_RETRIES:
+            action = None
+            await gate.acquire()
             try:
                 r = await asyncio.wait_for(
                     self.session.send(
@@ -353,6 +430,7 @@ class _Lane:
                     ),
                     FETCH_TIMEOUT,
                 )
+                gate.success()
                 return r.bytes if isinstance(r, raw.types.upload.File) else b""
             except asyncio.CancelledError:
                 raise
@@ -362,23 +440,35 @@ class _Lane:
                 STATS["retries"] += 1
                 if name in ("FloodWait", "FloodPremiumWait"):
                     wait = _flood_seconds(e)
-                    if wait > MAX_FLOOD_SLEEP:
+                    if gate.flood(wait):
+                        log.warning("FloodWait %ss on client %s -> pausing it, limit now %s",
+                                    wait, self.idx, gate.limit)
+                    flood_left -= wait
+                    if wait > MAX_FLOOD_SLEEP or flood_left < 0:
                         raise
-                    log.warning("FloodWait %ss on client %s", wait, self.idx)
-                    await asyncio.sleep(wait + 0.5)
-                elif name in _FILE_REF_ERRORS:
-                    self.file_id = await self.streamer.get_file_properties(self.id, refresh=True)
-                    self.location = await self.streamer.get_location(self.file_id)
+                    continue          # does not use a retry; the gate holds everyone back
+                attempt += 1
+                if name in _FILE_REF_ERRORS:
+                    action = ("ref", 0)
                 elif isinstance(e, (asyncio.TimeoutError, TimeoutError)) or getattr(e, "CODE", 0) >= 500:
                     # NOTE: checked before OSError because TimeoutError is an OSError
-                    if attempt >= 1:
-                        await self._renew_session()
-                    await asyncio.sleep(min(0.3 * (2 ** attempt), 3))
+                    action = ("renew" if attempt >= 2 else "sleep", min(0.3 * (2 ** attempt), 3))
                 elif name in _SESSION_ERRORS or isinstance(e, (ConnectionError, OSError, RuntimeError)):
-                    await self._renew_session()
-                    await asyncio.sleep(min(0.3 * (2 ** attempt), 3))
+                    action = ("renew", min(0.3 * (2 ** attempt), 3))
                 else:
                     raise
+            finally:
+                gate.release()
+
+            # recovery happens OUTSIDE the gate so it never blocks other requests
+            kind, delay = action
+            if kind == "ref":
+                self.file_id = await self.streamer.get_file_properties(self.id, refresh=True)
+                self.location = await self.streamer.get_location(self.file_id)
+            elif kind == "renew":
+                await self._renew_session()
+            if delay:
+                await asyncio.sleep(delay)
         raise last if last else RuntimeError("fetch failed")
 
     # --------------------------------------------------------------- runners
