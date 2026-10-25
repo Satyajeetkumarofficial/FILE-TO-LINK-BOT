@@ -120,6 +120,12 @@ MAX_INFLIGHT_CHUNKS = max(8, _env_int("MAX_INFLIGHT_CHUNKS", 128))
 # One GetFile call: retries and per-attempt timeout (seconds).
 FETCH_RETRIES = max(1, _env_int("FETCH_RETRIES", 5))
 FETCH_TIMEOUT = max(5, _env_int("FETCH_TIMEOUT", 30))
+# Max simultaneous GetFile calls PER BOT. Telegram answers FLOOD_WAIT when one bot is
+# hammered; the limit auto-shrinks on a FloodWait and slowly grows back (min..max).
+MAX_REQUESTS_PER_CLIENT = max(2, _env_int("MAX_REQUESTS_PER_CLIENT", 16))
+MIN_REQUESTS_PER_CLIENT = max(1, _env_int("MIN_REQUESTS_PER_CLIENT", 3))
+# Total seconds one chunk may spend waiting out FloodWaits before the stream gives up.
+FLOOD_BUDGET = max(5, _env_int("FLOOD_BUDGET", 90))
 # Longest FloodWait we are willing to sit out inside a stream (seconds).
 MAX_FLOOD_SLEEP = max(1, _env_int("MAX_FLOOD_SLEEP", 20))
 # Cache of link-expiry setting / file records to spare MongoDB (seconds).

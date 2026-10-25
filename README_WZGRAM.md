@@ -26,6 +26,9 @@
 | `MAX_STREAMS_PER_IP` | 16 | per-IP parallel connections |
 | `MAX_INFLIGHT_CHUNKS` | 128 | approx. RAM budget in MB for buffers |
 | `FETCH_RETRIES` / `FETCH_TIMEOUT` | 5 / 30 | per-chunk retries / seconds |
+| `MAX_REQUESTS_PER_CLIENT` | 16 | max parallel GetFile per bot; auto-shrinks on FloodWait, grows back slowly |
+| `MIN_REQUESTS_PER_CLIENT` | 3 | lowest value the limit may shrink to |
+| `FLOOD_BUDGET` | 90 | seconds a chunk may wait out FloodWaits before the stream is aborted |
 | `WORKERS` | 50 | bot handler concurrency |
 
 Small host (512 MB): `MAX_CONCURRENT_STREAMS=40 MAX_INFLIGHT_CHUNKS=64`. Big host: raise both.
