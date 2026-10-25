@@ -1,6 +1,6 @@
-pyrofork==2.3.48
-tgcrypto
-aiohttp
+wzgram>=3.0.8,<4
+uvloop; sys_platform != "win32"
+aiohttp>=3.9,<4
 python-dotenv<=0.20.0
 motor
 aiofiles
@@ -11,5 +11,3 @@ psutil
 jinja2
 pytz
 shortzy
-
-

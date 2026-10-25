@@ -1,9 +1,16 @@
-FROM python:3.10.8-slim-bullseye
-RUN apt update && apt upgrade -y
-RUN apt install git -y
-COPY requirements.txt /requirements.txt
-RUN pip3 install -U pip && pip3 install -U -r requirements.txt
-RUN mkdir /rexbots
+FROM python:3.11-slim-bookworm
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git \
+ && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /rexbots
-COPY . /rexbots
+COPY requirements.txt .
+RUN pip install -U pip && pip install -U -r requirements.txt
+
+COPY . .
 CMD ["python", "bot.py"]

@@ -1,11 +1,39 @@
 from os import environ, getenv
 from Script import script
 
+
+# ───────────────────────── safe env helpers ─────────────────────────
+def _env_bool(name: str, default: bool) -> bool:
+    """'False' / '0' / 'no' / 'off' / '' are really False (plain environ.get() is not)."""
+    val = environ.get(name)
+    if val is None:
+        return default
+    val = str(val).strip().lower()
+    if val == "":
+        return default
+    return val in ("1", "true", "yes", "y", "on")
+
+
+def _env_int(name: str, default: int = 0) -> int:
+    """Never crashes on missing / malformed numbers."""
+    try:
+        return int(str(environ.get(name, default)).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _required(name: str) -> str:
+    val = environ.get(name, "").strip()
+    if not val:
+        raise SystemExit(f"❌ Missing required environment variable: {name}")
+    return val
+
+
 # 🚀 __Bot Configuration__
 SESSION = environ.get('SESSION', 'ProBotz')  # Session name
-API_ID = int(environ.get('API_ID', ''))
-API_HASH = environ.get('API_HASH', '')
-BOT_TOKEN = environ.get('BOT_TOKEN', '')
+API_ID = int(_required('API_ID'))
+API_HASH = _required('API_HASH')
+BOT_TOKEN = _required('BOT_TOKEN')
 
 # 🚫 __Non Streaming Channels__
 NO_STREAM_CHANNELS = [int(i) for i in environ.get("NO_STREAM_CHANNELS", "-1002269651634, -1001887894502").replace(",", " ").split()]
@@ -23,22 +51,22 @@ HOW_TO_VERIFY = environ.get('HOW_TO_VERIFY', 'https://t.me/ProBotUpdate')
 HOW_TO_OPEN = environ.get('HOW_TO_OPEN', 'https://t.me/ProBotUpdate')
 
 # 📢 __Log Channels__
-BIN_CHANNEL = int(environ.get("BIN_CHANNEL", ''))
-LOG_CHANNEL = int(environ.get("LOG_CHANNEL", '-'))
-PREMIUM_LOGS = int(environ.get("PREMIUM_LOGS", ''))
-VERIFIED_LOG = int(environ.get('VERIFIED_LOG', ''))
-SUPPORT_GROUP = int(environ.get("SUPPORT_GROUP", ""))
+BIN_CHANNEL = int(_required("BIN_CHANNEL"))
+LOG_CHANNEL = _env_int("LOG_CHANNEL", 0)
+PREMIUM_LOGS = _env_int("PREMIUM_LOGS", 0)
+VERIFIED_LOG = _env_int('VERIFIED_LOG', 0)
+SUPPORT_GROUP = _env_int("SUPPORT_GROUP", 0)
 
 # ✅ __Feature Toggles__
 VERIFY = False  # Enable user verification
-FSUB = environ.get("FSUB", True)  # Force Subscribe
-ENABLE_LIMIT = environ.get("ENABLE_LIMIT", True)
+FSUB = _env_bool("FSUB", True)  # Force Subscribe
+ENABLE_LIMIT = _env_bool("ENABLE_LIMIT", True)
 BATCH_VERIFY = False
 IS_SHORTLINK = False
-MAINTENANCE_MODE = environ.get("MAINTENANCE_MODE", False)
-PROTECT_CONTENT = environ.get('PROTECT_CONTENT', False)
-PUBLIC_FILE_STORE = environ.get('PUBLIC_FILE_STORE', True)
-BATCH_PROTECT_CONTENT = environ.get('BATCH_PROTECT_CONTENT', False)
+MAINTENANCE_MODE = _env_bool("MAINTENANCE_MODE", False)
+PROTECT_CONTENT = _env_bool('PROTECT_CONTENT', False)
+PUBLIC_FILE_STORE = _env_bool('PUBLIC_FILE_STORE', True)
+BATCH_PROTECT_CONTENT = _env_bool('BATCH_PROTECT_CONTENT', False)
 
 # 🔗 __Shortlink Configuration__
 SHORTLINK_URL = environ.get('SHORTLINK_URL', '')
@@ -61,22 +89,49 @@ BATCH_FILE_CAPTION = environ.get('BATCH_FILE_CAPTION', script.CAPTION)
 CHANNEL_FILE_CAPTION = environ.get('CHANNEL_FILE_CAPTION', script.CAPTION)
 
 # ⏱️ __Time & Limits__
-PING_INTERVAL = int(environ.get("PING_INTERVAL", 1200))
-SLEEP_THRESHOLD = int(environ.get('SLEEP_THRESHOLD', 60))
-RATE_LIMIT_TIMEOUT = int(environ.get("RATE_LIMIT_TIMEOUT", 600))
-MAX_FILES = int(environ.get("MAX_FILES", 50))
-VERIFY_EXPIRE = int(environ.get('VERIFY_EXPIRE', 90))  # Hours
+PING_INTERVAL = _env_int("PING_INTERVAL", 1200)
+SLEEP_THRESHOLD = _env_int('SLEEP_THRESHOLD', 60)
+RATE_LIMIT_TIMEOUT = _env_int("RATE_LIMIT_TIMEOUT", 600)
+MAX_FILES = _env_int("MAX_FILES", 50)
+VERIFY_EXPIRE = _env_int('VERIFY_EXPIRE', 90)  # Hours
 
 # ⚙️ __Worker & App Config__
-WORKERS = int(environ.get('WORKERS', 10))
+WORKERS = _env_int('WORKERS', 50)
 MULTI_CLIENT = True
 NAME = environ.get('name', 'ProBotz')
+
+
+# 🚀 __Streaming / Speed / Stability tuning__ (all optional, safe defaults)
+# GetFile requests kept in flight per worker. 4-6 is the sweet spot.
+PREFETCH_WINDOW = max(1, _env_int("PREFETCH_WINDOW", 5))
+# Max bot accounts (MULTI_TOKEN*) used in parallel for ONE stream.
+# Automatically reduced when many users stream at once (fair sharing).
+MAX_PARALLEL_CLIENTS = max(1, _env_int("MAX_PARALLEL_CLIENTS", 4))
+# Don't split tiny ranges across bots: every worker gets at least this many MB.
+MIN_PARTS_PER_WORKER = max(1, _env_int("MIN_PARTS_PER_WORKER", 4))
+# Hard cap on simultaneous open streams. Extra requests wait, then get 503.
+MAX_CONCURRENT_STREAMS = max(1, _env_int("MAX_CONCURRENT_STREAMS", 100))
+# Per-IP cap (download managers open many connections; 16 is generous).
+MAX_STREAMS_PER_IP = max(1, _env_int("MAX_STREAMS_PER_IP", 16))
+# How long an over-limit request waits for a free slot before a 503.
+STREAM_QUEUE_TIMEOUT = max(1, _env_int("STREAM_QUEUE_TIMEOUT", 20))
+# Global cap on 1 MB chunks buffered/in flight across ALL streams (~= max RAM in MB).
+MAX_INFLIGHT_CHUNKS = max(8, _env_int("MAX_INFLIGHT_CHUNKS", 128))
+# One GetFile call: retries and per-attempt timeout (seconds).
+FETCH_RETRIES = max(1, _env_int("FETCH_RETRIES", 5))
+FETCH_TIMEOUT = max(5, _env_int("FETCH_TIMEOUT", 30))
+# Longest FloodWait we are willing to sit out inside a stream (seconds).
+MAX_FLOOD_SLEEP = max(1, _env_int("MAX_FLOOD_SLEEP", 20))
+# Cache of link-expiry setting / file records to spare MongoDB (seconds).
+SETTINGS_CACHE_TTL = max(1, _env_int("SETTINGS_CACHE_TTL", 30))
+# Max cached file properties per bot client.
+FILE_CACHE_SIZE = max(100, _env_int("FILE_CACHE_SIZE", 5000))
 
 # 🌐 __Web Server__
 ON_HEROKU = 'DYNO' in environ
 APP_NAME = environ.get('APP_NAME') if ON_HEROKU else None
 
-PORT = int(environ.get('PORT', 8080))
+PORT = _env_int('PORT', 8080)
 NO_PORT = str(environ.get("NO_PORT", "true")).lower() in ("true", "1", "yes")
 HAS_SSL = str(environ.get("HAS_SSL", "true")).lower() in ("true", "1", "yes")
 
