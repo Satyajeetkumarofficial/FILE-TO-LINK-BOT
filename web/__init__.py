@@ -56,4 +56,4 @@ async def check_expired_premium(client):
                 except Exception as e:
                     print(f"[REMINDER ERROR] {e}")
                 await sleep(0.5)
-        await sleep(1)
+        await sleep(60)

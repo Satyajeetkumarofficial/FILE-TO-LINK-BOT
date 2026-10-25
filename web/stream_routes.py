@@ -1,18 +1,103 @@
-import re, math, logging, secrets, time, mimetypes
+import re
+import time
+import logging
+import secrets
+import asyncio
+import urllib.parse
+from contextlib import aclosing, suppress
+
 from aiohttp import web
 from aiohttp.http_exceptions import BadStatusLine
-from info import *
-from web.server import multi_clients, work_loads, StreamBot
+
+from info import (
+    BOT_USERNAME,
+    MAX_CONCURRENT_STREAMS,
+    MAX_STREAMS_PER_IP,
+    STREAM_QUEUE_TIMEOUT,
+    SETTINGS_CACHE_TTL,
+)
+from web.server import multi_clients, work_loads
 from web.server.exceptions import FIleNotFound, InvalidHash
 from database.users_db import db
-from web.utils.custom_dl import ByteStreamer
+from web.utils.custom_dl import (
+    get_byte_streamer, stream_file, compute_geometry, active_streams, active_lanes,
+    pick_client_index, STATS,
+)
 from utils import get_readable_time
 from web.utils import StartTime, __version__
 from web.utils.render_template import render_page
 
+log = logging.getLogger("web")
 routes = web.RouteTableDef()
-class_cache = {}
 
+CHUNK_SIZE = 1024 * 1024
+PATH_RE = re.compile(r"^([a-zA-Z0-9_-]{6})(\d+)$")
+RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
+
+# ---------------------------------------------------------------- limiters
+_stream_slots = None            # asyncio.Semaphore, created lazily inside the loop
+_waiting = 0
+_per_ip: dict = {}
+
+
+def _slots() -> asyncio.Semaphore:
+    global _stream_slots
+    if _stream_slots is None:
+        _stream_slots = asyncio.Semaphore(MAX_CONCURRENT_STREAMS)
+    return _stream_slots
+
+
+def _client_ip(request: web.Request) -> str:
+    fwd = request.headers.get("X-Forwarded-For")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.remote or "?"
+
+
+# ------------------------------------------------- tiny TTL cache for MongoDB
+_cache: dict = {}
+
+
+async def _cached(key, loader):
+    now = time.monotonic()
+    hit = _cache.get(key)
+    if hit and now - hit[0] < SETTINGS_CACHE_TTL:
+        return hit[1]
+    value = await loader()
+    _cache[key] = (now, value)
+    if len(_cache) > 20000:
+        _cache.clear()
+    return value
+
+
+async def _check_expiry(file_id: int):
+    """Return a 410 response if the link has expired, else None."""
+    try:
+        expiry_seconds = await _cached("link_expiry", db.get_link_expiry)
+        if expiry_seconds and expiry_seconds > 0:
+            rec = await _cached(("file", file_id), lambda: db.files.find_one({"file_id": file_id}))
+            if rec and time.time() - rec.get("timestamp", 0) > expiry_seconds:
+                return web.Response(
+                    status=410,
+                    text="🚫 This link has expired.\nPlease request a new link from the bot.",
+                )
+    except Exception:
+        log.warning("expiry check failed (ignored)", exc_info=True)
+    return None
+
+
+def _parse_path(request: web.Request):
+    path = request.match_info["path"]
+    m = PATH_RE.match(path)
+    if m:
+        return int(m.group(2)), m.group(1)
+    m = re.search(r"(\d+)(?:\/\S+)?", path)
+    if not m:
+        raise web.HTTPBadRequest(text="Bad link")
+    return int(m.group(1)), request.rel_url.query.get("hash")
+
+
+# ------------------------------------------------------------------ routes
 @routes.get("/", allow_head=True)
 async def root_route_handler(_):
     return web.json_response({
@@ -20,39 +105,32 @@ async def root_route_handler(_):
         "uptime": get_readable_time(time.time() - StartTime),
         "telegram_bot": "@" + BOT_USERNAME,
         "connected_bots": len(multi_clients),
-        "loads": {
-            "bot" + str(i + 1): load
-            for i, (_, load) in enumerate(
-                sorted(work_loads.items(), key=lambda x: x[1], reverse=True)
-            )
-        },
+        "loads": {f"bot{i}": load for i, load in sorted(work_loads.items())},
+        "active_streams": active_streams(),
+        "active_lanes": active_lanes(),
+        "waiting": _waiting,
+        "served_mb": round(STATS["bytes"] / 1048576, 1),
+        "errors": STATS["errors"],
+        "retries": STATS["retries"],
         "version": __version__,
     })
+
+
+@routes.get("/health", allow_head=True)
+async def health_handler(_):
+    return web.json_response({"ok": True})
+
 
 @routes.get(r"/watch/{path:\S+}", allow_head=True)
 async def stream_watch_handler(request: web.Request):
     try:
-        path = request.match_info["path"]
-        match = re.search(r"^([a-zA-Z0-9_-]{6})(\d+)$", path)
-        if match:
-            secure_hash = match.group(1)
-            id = int(match.group(2))
-        else:
-            id = int(re.search(r"(\d+)(?:\/\S+)?", path).group(1))
-            secure_hash = request.rel_url.query.get("hash")
-
-        # 🕒 Link Expiry Check
-        expiry_seconds = await db.get_link_expiry()
-        if expiry_seconds > 0:
-            file_record = await db.files.find_one({"file_id": id})
-            if file_record:
-                created_at = file_record.get("timestamp", 0)
-                if time.time() - created_at > expiry_seconds:
-                    return web.Response(status=410, text="🚫 This link has expired.\nPlease request a new link from the bot.")
-
-        return web.Response(
-            text=await render_page(id, secure_hash), content_type="text/html"
-        )
+        id, secure_hash = _parse_path(request)
+        expired = await _check_expiry(id)
+        if expired:
+            return expired
+        return web.Response(text=await render_page(id, secure_hash), content_type="text/html")
+    except web.HTTPException:
+        raise
     except InvalidHash as e:
         raise web.HTTPForbidden(text=e.message)
     except FIleNotFound as e:
@@ -60,113 +138,184 @@ async def stream_watch_handler(request: web.Request):
     except (AttributeError, BadStatusLine, ConnectionResetError):
         return web.Response(status=400, text="Bad Request")
     except Exception as e:
-        logging.critical(e)
-        return web.Response(status=500, text=str(e))
+        log.exception("watch page error")
+        return web.Response(status=500, text="Internal error, please retry")
+
 
 @routes.get(r"/{path:\S+}", allow_head=True)
 async def stream_handler(request: web.Request):
     try:
-        path = request.match_info["path"]
-        match = re.search(r"^([a-zA-Z0-9_-]{6})(\d+)$", path)
-        if match:
-            secure_hash = match.group(1)
-            id = int(match.group(2))
-        else:
-            id = int(re.search(r"(\d+)(?:\/\S+)?", path).group(1))
-            secure_hash = request.rel_url.query.get("hash")
-
-        # 🕒 Link Expiry Check
-        expiry_seconds = await db.get_link_expiry()
-        if expiry_seconds > 0:
-            file_record = await db.files.find_one({"file_id": id})
-            if file_record:
-                created_at = file_record.get("timestamp", 0)
-                if time.time() - created_at > expiry_seconds:
-                    return web.Response(status=410, text="🚫 This link has expired.\nPlease request a new link from the bot.")
-
+        id, secure_hash = _parse_path(request)
+        expired = await _check_expiry(id)
+        if expired:
+            return expired
         return await media_streamer(request, id, secure_hash)
+    except web.HTTPException:
+        raise
     except InvalidHash as e:
         raise web.HTTPForbidden(text=e.message)
     except FIleNotFound as e:
         raise web.HTTPNotFound(text=e.message)
     except (AttributeError, BadStatusLine, ConnectionResetError):
         return web.Response(status=400, text="Bad Request")
-    except Exception as e:
-        logging.critical(e)
-        return web.Response(status=500, text=str(e))
+    except Exception:
+        log.exception("stream error")
+        return web.Response(status=500, text="Internal error, please retry")
+
+
+def _parse_range(header: str, file_size: int):
+    """Returns (from_bytes, until_bytes) or None when unsatisfiable. Supports a-b, a-, -n."""
+    m = RANGE_RE.match(header.strip())
+    if not m or (m.group(1) == "" and m.group(2) == ""):
+        raise ValueError("bad range")
+    if m.group(1) == "":                       # suffix: last n bytes
+        n = int(m.group(2))
+        if n <= 0:
+            return None
+        return max(0, file_size - n), file_size - 1
+    start = int(m.group(1))
+    end = int(m.group(2)) if m.group(2) else file_size - 1
+    end = min(end, file_size - 1)              # browsers may ask beyond EOF
+    if start >= file_size or end < start:
+        return None
+    return start, end
+
+
+def _content_disposition(name: str) -> str:
+    safe = name.replace('"', "'").replace("\r", " ").replace("\n", " ")
+    ascii_name = safe.encode("ascii", "ignore").decode() or "file"
+    return f"inline; filename=\"{ascii_name}\"; filename*=UTF-8''{urllib.parse.quote(name)}"
+
 
 async def media_streamer(request: web.Request, id: int, secure_hash: str):
-    range_header = request.headers.get("Range", None)
+    global _waiting
 
-    index = min(work_loads, key=work_loads.get)
-    faster_client = multi_clients[index]
+    if not multi_clients:
+        return web.Response(status=503, text="Bot is starting, retry in a few seconds")
 
-    if MULTI_CLIENT:
-        logging.info(f"📡 Client {index} is now serving: {request.remote}")
+    # ---- pick the least loaded client and read the file properties
+    index = pick_client_index()
+    streamer = get_byte_streamer(multi_clients[index])
+    file_id = await streamer.get_file_properties(id)
 
-    tg_connect = class_cache.get(faster_client) or ByteStreamer(faster_client)
-    class_cache[faster_client] = tg_connect
-
-    file_id = await tg_connect.get_file_properties(id)
-
-    if file_id.unique_id[:6] != secure_hash:
+    if not secure_hash or file_id.unique_id[:6] != secure_hash:
         raise InvalidHash
 
-    file_size = file_id.file_size
+    file_size = int(file_id.file_size or 0)
+    is_head = request.method == "HEAD"
+    range_header = request.headers.get("Range")
 
-    if range_header:
+    from_bytes, until_bytes = 0, file_size - 1
+    partial = False
+    if range_header and file_size > 0:
         try:
-            match = re.match(r"bytes=(\d+)-(\d*)", range_header)
-            from_bytes = int(match.group(1))
-            until_bytes = int(match.group(2)) if match.group(2) else file_size - 1
-        except Exception:
-            return web.Response(status=400, text="Invalid Range header")
-    else:
-        from_bytes = 0
-        until_bytes = file_size - 1
+            parsed = _parse_range(range_header, file_size)
+        except ValueError:
+            parsed = (0, file_size - 1)         # malformed header -> ignore, serve full file
+        else:
+            partial = parsed is not None
+        if parsed is None:
+            return web.Response(
+                status=416, text="416: Range Not Satisfiable",
+                headers={"Content-Range": f"bytes */{file_size}"},
+            )
+        from_bytes, until_bytes = parsed
 
-    # Validate range
-    if until_bytes >= file_size or from_bytes < 0 or until_bytes < from_bytes:
-        return web.Response(
-            status=416,
-            text="416: Range Not Satisfiable",
-            headers={"Content-Range": f"bytes */{file_size}"}
-        )
-
-    # Setup stream vars
-    chunk_size = 1024 * 1024
-    offset = from_bytes - (from_bytes % chunk_size)
-    first_part_cut = from_bytes - offset
-    last_part_cut = until_bytes % chunk_size + 1
-    part_count = math.ceil(until_bytes / chunk_size) - math.floor(offset / chunk_size)
-    req_length = until_bytes - from_bytes + 1
-
+    req_length = max(0, until_bytes - from_bytes + 1)
     mime_type = file_id.mime_type or "application/octet-stream"
     file_name = file_id.file_name or f"{secrets.token_hex(2)}.bin"
 
-    response = web.StreamResponse(
-        status=206 if range_header else 200,
-        reason="Partial Content" if range_header else "OK",
-        headers={
-            "Content-Type": mime_type,
-            "Content-Length": str(req_length),
-            "Content-Range": f"bytes {from_bytes}-{until_bytes}/{file_size}",
-            "Content-Disposition": f'inline; filename="{file_name}"',
-            "Accept-Ranges": "bytes",
-        }
-    )
+    headers = {
+        "Content-Type": mime_type,
+        "Content-Length": str(req_length),
+        "Content-Disposition": _content_disposition(file_name),
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "private, max-age=3600",
+        "X-Content-Type-Options": "nosniff",
+    }
+    if partial:
+        headers["Content-Range"] = f"bytes {from_bytes}-{until_bytes}/{file_size}"
 
-    await response.prepare(request)
+    status = 206 if partial else 200
+    if is_head or req_length == 0:
+        return web.Response(status=status, headers=headers)
+
+    # ---- admission control: protects RAM / bandwidth when many users arrive
+    ip = _client_ip(request)
+    if _per_ip.get(ip, 0) >= MAX_STREAMS_PER_IP:
+        return web.Response(status=429, text="Too many parallel downloads from your IP",
+                            headers={"Retry-After": "5"})
+    sem = _slots()
+    _waiting += 1
+    try:
+        await asyncio.wait_for(sem.acquire(), STREAM_QUEUE_TIMEOUT)
+    except asyncio.TimeoutError:
+        return web.Response(status=503, text="Server is busy, please retry in a moment",
+                            headers={"Retry-After": "10"})
+    finally:
+        _waiting -= 1
+    _per_ip[ip] = _per_ip.get(ip, 0) + 1
 
     try:
-        async for chunk in tg_connect.yield_file(
-            file_id, index, offset, first_part_cut, last_part_cut, part_count, chunk_size
-        ):
-            await response.write(chunk)
-    except Exception as e:
-        logging.exception(f"Error streaming file {file_id.file_unique_id}: {e}")
-    finally:
-        await response.write_eof()
+        # ---- stream geometry
+        offset, first_part_cut, last_part_cut, part_count = compute_geometry(
+            from_bytes, until_bytes, CHUNK_SIZE
+        )
 
-    return response
-        
+        response = web.StreamResponse(status=status, headers=headers)
+        sent = 0
+        prepared = False
+        failure = None
+
+        # one transparent retry if the stream breaks before the first byte
+        for attempt in range(2):
+            try:
+                async with aclosing(stream_file(
+                    index, file_id, id, offset, first_part_cut, last_part_cut, part_count, CHUNK_SIZE
+                )) as gen:
+                    async for chunk in gen:
+                        if not prepared:
+                            await response.prepare(request)
+                            prepared = True
+                        await response.write(chunk)
+                        sent += len(chunk)
+                failure = None
+                break
+            except (ConnectionResetError, asyncio.CancelledError):
+                # client went away - nothing to report
+                raise
+            except Exception as e:
+                if request.transport is None or request.transport.is_closing():
+                    return response            # client disconnected mid-stream
+                failure = e
+                if sent == 0 and attempt == 0:
+                    log.warning("stream failed before first byte (%r), retrying once", e)
+                    with suppress(Exception):
+                        await streamer.get_file_properties(id, refresh=True)
+                    continue
+                break
+
+        if failure is not None:
+            log.error("stream aborted after %s/%s bytes: %r", sent, req_length, failure)
+            if not prepared:
+                return web.Response(status=502, text="Upstream error, please retry")
+            # tell the client the body is incomplete (it can resume with Range)
+            if request.transport is not None:
+                request.transport.close()
+            return response
+
+        if not prepared:  # empty generator (should not happen)
+            await response.prepare(request)
+        with suppress(ConnectionResetError, RuntimeError):
+            await response.write_eof()
+        return response
+
+    except (ConnectionResetError, asyncio.CancelledError):
+        raise
+    finally:
+        sem.release()
+        left = _per_ip.get(ip, 1) - 1
+        if left <= 0:
+            _per_ip.pop(ip, None)
+        else:
+            _per_ip[ip] = left
