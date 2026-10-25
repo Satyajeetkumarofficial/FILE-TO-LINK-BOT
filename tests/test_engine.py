@@ -204,6 +204,23 @@ async def main():
           f"lanes started={len(lanes_seen)} for 8 streams (single stream would use 4 each = 32)")
     check("lanes < 32 under load", len(lanes_seen) < 32)
 
+    # 13 --------------------------------------------------------------- FloodWait storm (the real-world log)
+    setup_clients(1)
+    M.FAULTS["flood_over"] = 10          # Telegram refuses > 10 parallel GetFile on this bot
+    M.COUNTERS["max_inflight"] = 0
+    storm = [(random.randrange(0, 5 * CH), 0) for _ in range(30)]
+    storm = [(a, a + 9 * CH) for a, _ in storm]
+    t0 = time.time()
+    res = await asyncio.gather(*[get_stream(a, b) for a, b in storm], return_exceptions=True)
+    M.FAULTS["flood_over"] = 0
+    good = sum(1 for (a, b), r in zip(storm, res) if not isinstance(r, Exception) and r == expected(a, b))
+    gate = dl.get_byte_streamer(multi_clients[0]).gate
+    check("30 users on ONE bot while Telegram floods above 10 parallel calls: all complete", good == 30,
+          f"{good}/30 in {time.time()-t0:.1f}s, gate limit adapted to {gate.limit}")
+    check("gate kept parallel calls near the safe level", gate.limit <= 10 or gate.limit < dl.MAX_REQUESTS_PER_CLIENT,
+          f"peak={M.COUNTERS['max_inflight']}")
+    check("state clean after flood storm", idle_state())
+
     print("\n" + ("ALL TESTS PASSED" if failed == 0 else f"{failed} TEST(S) FAILED"))
     return failed
 

@@ -16,7 +16,7 @@ def content(off: int, n: int) -> bytes:
 
 
 FILE_SIZE = 37 * 1024 * 1024 + 12345     # not a multiple of 1 MB
-FAULTS = {"p": 0.0, "kinds": ("timeout", "conn", "flood", "rpc500"), "hard_fail": False}
+FAULTS = {"flood_over": 0, "p": 0.0, "kinds": ("timeout", "conn", "flood", "rpc500"), "hard_fail": False}
 COUNTERS = {"inflight": 0, "max_inflight": 0, "calls": 0, "ref_expired_once": set()}
 LATENCY = (0.02, 0.05)
 
@@ -124,6 +124,8 @@ class Session:
             COUNTERS["inflight"] += 1
             COUNTERS["max_inflight"] = max(COUNTERS["max_inflight"], COUNTERS["inflight"])
             try:
+                if FAULTS["flood_over"] and COUNTERS["inflight"] > FAULTS["flood_over"]:
+                    raise FloodWait()          # like Telegram: too many parallel GetFile -> FLOOD_WAIT
                 await asyncio.sleep(random.uniform(*LATENCY))
                 if FAULTS["hard_fail"]:
                     raise ConnectionError("dead")
