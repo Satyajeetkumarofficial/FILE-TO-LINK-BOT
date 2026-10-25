@@ -28,9 +28,13 @@ class TokenParser:
 
         :return: Dictionary of token mappings
         """
-        self.tokens = {
-            idx + 1: value
-            for idx, (key, value) in enumerate(environ.items())
-            if key.startswith("MULTI_TOKEN") and value.strip() != ""
-        }
+        def _order(key: str):
+            tail = key[len("MULTI_TOKEN"):]
+            return (0, int(tail)) if tail.isdigit() else (1, tail)
+
+        keys = sorted(
+            (k for k, v in environ.items() if k.startswith("MULTI_TOKEN") and v.strip() != ""),
+            key=_order,
+        )
+        self.tokens = {i + 1: environ[k].strip() for i, k in enumerate(keys)}
         return self.tokens
