@@ -241,8 +241,8 @@ async def media_streamer(request: web.Request, id: int, secure_hash: str):
         return web.Response(status=status, headers=headers)
 
     # ---- admission control: protects RAM / bandwidth when many users arrive
-    ip = _client_ip(request)
-    if _per_ip.get(ip, 0) >= MAX_STREAMS_PER_IP:
+    ip = request.headers.get("CF-Connecting-IP") or _client_ip(request)
+    if MAX_STREAMS_PER_IP and _per_ip.get(ip, 0) >= MAX_STREAMS_PER_IP:
         return web.Response(status=429, text="Too many parallel downloads from your IP",
                             headers={"Retry-After": "5"})
     sem = _slots()
