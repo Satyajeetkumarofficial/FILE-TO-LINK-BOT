@@ -22,9 +22,9 @@ class WebXBot(Client):
             api_id=API_ID,
             api_hash=API_HASH,
             bot_token=BOT_TOKEN,
-            workers=50,
+            workers=WORKERS,
             plugins={"root": "plugins"},
-            sleep_threshold=5,
+            sleep_threshold=SLEEP_THRESHOLD,
         )
 
     async def set_self(self):

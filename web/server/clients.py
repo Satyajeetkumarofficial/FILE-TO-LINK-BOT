@@ -1,60 +1,89 @@
 import asyncio
 import logging
-from info import *
+
+import session_store
+from info import API_ID, API_HASH, BOT_TOKEN, SLEEP_THRESHOLD
 from pyrogram import Client
 from web.utils.config_parser import TokenParser
 from web.server import multi_clients, work_loads, StreamBot
 
+log = logging.getLogger("clients")
+
+
+async def _start_one(client_id: int, token: str) -> bool:
+    """Start one extra bot (re-using its stored login). Returns True when it is serving."""
+    stored = await session_store.load(token)
+    for attempt in range(3):
+        try:
+            client = Client(
+                name=f"RXClient_{client_id}",
+                api_id=API_ID,
+                api_hash=API_HASH,
+                bot_token=token,
+                session_string=stored,
+                sleep_threshold=SLEEP_THRESHOLD,
+                no_updates=True,
+                in_memory=True,
+            )
+            await client.start()
+            if not stored:
+                await session_store.save(token, client)
+            multi_clients[client_id] = client
+            work_loads[client_id] = 0
+            log.info("Extra client %s is up (%s)", client_id, "stored login" if stored else "fresh login")
+            return True
+        except Exception as e:
+            wait = session_store.is_flood(e)
+            if wait:
+                log.error("Client %s: Telegram login FloodWait %ss - will retry in the background", client_id, wait)
+                asyncio.create_task(_retry_later(client_id, token, wait))
+                return False
+            if type(e).__name__ in session_store.BAD_SESSION and stored:
+                log.warning("Client %s: stored login rejected, logging in again", client_id)
+                await session_store.forget(token)
+                stored = None
+                continue
+            log.error("Failed to start client %s: %r", client_id, e)
+            await asyncio.sleep(3 * (attempt + 1))
+    return False
+
+
+async def _retry_later(client_id: int, token: str, wait: int):
+    await asyncio.sleep(wait + 5)
+    if not await _start_one(client_id, token):
+        log.error("Client %s could not be started in the background", client_id)
 
 
 async def initialize_clients():
-    global MULTI_CLIENT
     multi_clients[0] = StreamBot
     work_loads[0] = 0
 
     all_tokens = TokenParser().parse_from_env()
 
-    if not all_tokens:
-        logging.warning("No additional clients found, using default client")
+    # never start the main token (or a duplicate) twice - Telegram would fight over the session
+    seen = {BOT_TOKEN.strip()}
+    unique = {}
+    for cid, token in all_tokens.items():
+        t = token.strip()
+        if t in seen:
+            log.warning("MULTI_TOKEN%s duplicates another token - skipped", cid)
+            continue
+        seen.add(t)
+        unique[cid] = t
+
+    if not unique:
+        log.warning("No additional clients found, using the default client only")
         return
 
-    async def start_client(client_id: int, token: str):
-        try:
-            logging.info(f"Starting Client {client_id}...")
-            if client_id == len(all_tokens):
-                await asyncio.sleep(2)
-                logging.info("This will take some time, please wait...")
+    gate = asyncio.Semaphore(2)  # 2 at a time: gentle on Telegram AND on RAM during startup
 
-            client = await Client(
-                name=f"RXClient_{client_id}",
-                api_id=API_ID,
-                api_hash=API_HASH,
-                bot_token=token,
-                sleep_threshold=SLEEP_THRESHOLD,
-                no_updates=True,
-                in_memory=True
-            ).start()
+    async def guarded(cid, tok):
+        async with gate:
+            return await _start_one(cid, tok)
 
-            work_loads[client_id] = 0
-            return client_id, client
-
-        except Exception as e:
-            logging.error(f"❌ Failed to start Client {client_id}", exc_info=True)
-            return None
-
-    # Launch all clients
-    results = await asyncio.gather(*[
-        start_client(i, token) for i, token in all_tokens.items()
-    ])
-
-    # Filter out failed (None) results
-    valid_clients = {cid: cli for res in results if res for cid, cli in [res]}
-
-    # Update global client map
-    multi_clients.update(valid_clients)
+    await asyncio.gather(*[guarded(i, t) for i, t in unique.items()])
 
     if len(multi_clients) > 1:
-        MULTI_CLIENT = True
-        logging.info("✅ Multi-Client Mode Enabled")
+        log.info("✅ Multi-client mode: %s bots active", len(multi_clients))
     else:
-        logging.warning("No additional clients were initialized, using default client only.")
+        log.warning("No additional clients were initialized, using the default client only.")

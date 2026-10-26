@@ -6,8 +6,42 @@ from database.users_db import db
 from info import PREMIUM_LOGS
 from pyrogram import Client
 
+import logging
+import time as _time
+from os import environ
+
+_req_log = logging.getLogger("request")
+# LOG_REQUESTS: "errors" (default: only status >= 400), "all", or "off"
+_LOG_MODE = environ.get("LOG_REQUESTS", "errors").strip().lower()
+
+
+@web.middleware
+async def log_middleware(request, handler):
+    t0 = _time.monotonic()
+    status, err = 0, None
+    try:
+        resp = await handler(request)
+        status = getattr(resp, "status", 0)
+        return resp
+    except web.HTTPException as e:
+        status, err = e.status, e.text
+        raise
+    except BaseException as e:
+        status, err = 500, repr(e)
+        raise
+    finally:
+        if _LOG_MODE != "off" and request.path not in ("/health",) and (_LOG_MODE == "all" or status >= 400):
+            _req_log.info(
+                "%s %s -> %s %.2fs ip=%s range=%s ua=%s%s",
+                request.method, request.path, status, _time.monotonic() - t0,
+                request.headers.get("CF-Connecting-IP") or request.headers.get("X-Forwarded-For") or request.remote,
+                request.headers.get("Range", "-"), (request.headers.get("User-Agent") or "-")[:40],
+                f" err={err}" if err else "",
+            )
+
+
 async def web_server():
-    web_app = web.Application(client_max_size=30000000)
+    web_app = web.Application(client_max_size=30000000, middlewares=[log_middleware])
     web_app.add_routes(routes)
     return web_app
 
@@ -56,4 +90,4 @@ async def check_expired_premium(client):
                 except Exception as e:
                     print(f"[REMINDER ERROR] {e}")
                 await sleep(0.5)
-        await sleep(1)
+        await sleep(60)

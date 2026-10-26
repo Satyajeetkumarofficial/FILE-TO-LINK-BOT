@@ -1,108 +1,171 @@
-import os, sys, glob, pytz, asyncio, logging, importlib
-from pathlib import Path
+# NOTE: compat_pyrogram must be imported first - it makes `import pyrogram` work
+# whether the installed package exposes `pyrogram` or `wzgram`.
+import compat_pyrogram  # noqa: F401  (isort: skip)
+
+import asyncio
+import logging
+from datetime import date, datetime
+
+import pytz
+
+# ================= EVENT LOOP (uvloop when available) =================
+try:
+    import uvloop
+    loop = uvloop.new_event_loop()
+except Exception:  # not installed / not supported -> plain asyncio
+    loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+# ======================================================================
 
 from pyrogram import idle
-import pyrogram.utils  # Import pyrogram.utils explicitly
+import pyrogram.utils as _pyro_utils
 
-# ================= EVENT LOOP FIX (FINAL & SAFE) =================
-# Python 3.10+ compatible, no DeprecationWarning
-try:
-    loop = asyncio.get_running_loop()
-except RuntimeError:
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-# ================================================================
+# ---- newer channel ids: keep the library's own logic, only add a safe fallback ----
+_orig_get_peer_type = getattr(_pyro_utils, "get_peer_type", None)
 
-# Patch pyrogram.utils.get_peer_type to handle newer peer IDs
-def get_peer_type_new(peer_id: int) -> str:
-    peer_id_str = str(peer_id)
-    if not peer_id_str.startswith("-"):
+
+def _get_peer_type_safe(peer_id: int) -> str:
+    if _orig_get_peer_type is not None:
+        try:
+            return _orig_get_peer_type(peer_id)
+        except ValueError:
+            pass
+    s = str(peer_id)
+    if not s.startswith("-"):
         return "user"
-    elif peer_id_str.startswith("-100"):
+    if s.startswith("-100"):
         return "channel"
-    else:
-        return "chat"
+    return "chat"
 
-# Apply the patch
-pyrogram.utils.get_peer_type = get_peer_type_new
-pyrogram.utils.MIN_CHANNEL_ID = -1002822095763
+
+_pyro_utils.get_peer_type = _get_peer_type_safe
+try:
+    if getattr(_pyro_utils, "MIN_CHANNEL_ID", 0) > -1002822095763:
+        _pyro_utils.MIN_CHANNEL_ID = -1002822095763
+except Exception:
+    pass
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
-logging.getLogger("aiohttp").setLevel(logging.ERROR)
-logging.getLogger("pyrogram").setLevel(logging.ERROR)
-logging.getLogger("aiohttp.web").setLevel(logging.ERROR)
+for _name in ("aiohttp", "aiohttp.web", "aiohttp.access", "pyrogram", "wzgram"):
+    logging.getLogger(_name).setLevel(logging.ERROR)
 
-from info import *
-from Script import script
-from datetime import date, datetime
-from aiohttp import web
-from web import web_server, check_expired_premium
-from web.server import StreamBot
-from utils import Temp, ping_server
-from web.server.clients import initialize_clients
+from aiohttp import web                                   # noqa: E402
+from info import *                                        # noqa: E402,F401,F403
+from Script import script                                 # noqa: E402
+from web import web_server, check_expired_premium         # noqa: E402
+from web.server import StreamBot, multi_clients           # noqa: E402
+from web.server.clients import initialize_clients         # noqa: E402
+from utils import Temp, ping_server                       # noqa: E402
+import session_store                                      # noqa: E402
+import memguard                                           # noqa: E402
 
-ppath = "plugins/*.py"
-files = glob.glob(ppath)
+log = logging.getLogger("bot")
 
-StreamBot.start()
+
+async def _supervise(name, fn, *args):
+    """Run a background job forever; if it crashes, log and restart it."""
+    while True:
+        try:
+            await fn(*args)
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Background task %s crashed - restarting in 30s", name)
+            await asyncio.sleep(30)
+
+
+async def _notify(chat_id, text):
+    if not chat_id:
+        return
+    try:
+        await StreamBot.send_message(chat_id=chat_id, text=text)
+    except Exception as e:
+        log.warning("Could not notify %s: %r", chat_id, e)
+
+
+async def _login_main():
+    """Start the main bot re-using its stored login; survive login FloodWaits."""
+    stored = getattr(StreamBot, "stored_login", None)
+    if stored:
+        log.info("Using stored login for the main bot")
+
+    for attempt in range(8):
+        try:
+            await StreamBot.start()          # also loads everything in /plugins
+            if not stored:
+                await session_store.save(BOT_TOKEN, StreamBot)
+            return
+        except Exception as e:
+            wait = session_store.is_flood(e)
+            if wait:
+                log.error("Telegram login FloodWait %ss - waiting it out (web server stays up)", wait)
+                await asyncio.sleep(wait + 5)
+                continue
+            if type(e).__name__ in session_store.BAD_SESSION and stored:
+                log.warning("Stored login rejected - forgetting it, using a fresh login")
+                await session_store.forget(BOT_TOKEN)
+                stored = None
+                raise SystemExit("Stored login was invalid; restart once to log in fresh")
+            raise
+    raise SystemExit("Could not log in to Telegram")
+
 
 async def start():
-    print("\n")
-    print("Initalizing Your Bot")
+    print("\nInitializing Your Bot")
 
+    # web server FIRST: platform health checks pass while the bot logs in
+    runner = web.AppRunner(await web_server(), access_log=None, keepalive_timeout=75)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", PORT, backlog=2048).start()
+    log.info("Web server listening on port %s", PORT)
+
+    await _login_main()
     await initialize_clients()
-
-    for name in files:
-        patt = Path(name)
-        plugin_name = patt.stem.replace(".py", "")
-        plugins_dir = Path(f"plugins/{plugin_name}.py")
-        import_path = f"plugins.{plugin_name}"
-        spec = importlib.util.spec_from_file_location(import_path, plugins_dir)
-        load = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(load)
-        sys.modules[import_path] = load
-        print("Imported => " + plugin_name)
-
-    if ON_HEROKU:
-        asyncio.create_task(ping_server())
 
     me = await StreamBot.get_me()
     Temp.BOT = StreamBot
     Temp.ME = me.id
     Temp.U_NAME = me.username
     Temp.B_NAME = me.first_name
+    log.info("Bot @%s ready with %s bot client(s)", me.username, len(multi_clients))
+
+    tasks = [asyncio.create_task(_supervise("premium-check", check_expired_premium, StreamBot)),
+             asyncio.create_task(_supervise("memory-trim", memguard.trimmer))]
+    if ON_HEROKU:
+        tasks.append(asyncio.create_task(_supervise("ping", ping_server)))
 
     tz = pytz.timezone("Asia/Kolkata")
     today = date.today()
-    now = datetime.now(tz)
-    time = now.strftime("%H:%M:%S %p")
+    now = datetime.now(tz).strftime("%H:%M:%S %p")
+    await _notify(LOG_CHANNEL, script.RESTART_TXT.format(today, now))
+    await _notify(ADMINS[0] if ADMINS else 0, "<b>ʙᴏᴛ ʀᴇsᴛᴀʀᴛᴇᴅ !!</b>")
+    await _notify(SUPPORT_GROUP, f"<b>{me.mention} ʀᴇsᴛᴀʀᴛᴇᴅ 🤖</b>")
 
-    StreamBot.loop.create_task(check_expired_premium(StreamBot))
+    try:
+        await idle()
+    finally:
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await runner.cleanup()
+        for c in list(multi_clients.values()):
+            if c is not StreamBot:
+                try:
+                    await c.stop()
+                except Exception:
+                    pass
+        try:
+            await StreamBot.stop()
+        except Exception:
+            pass
 
-    await StreamBot.send_message(
-        chat_id=LOG_CHANNEL,
-        text=script.RESTART_TXT.format(today, time)
-    )
-    await StreamBot.send_message(
-        chat_id=ADMINS[0],
-        text="<b>ʙᴏᴛ ʀᴇsᴛᴀʀᴛᴇᴅ !!</b>"
-    )
-    await StreamBot.send_message(
-        chat_id=SUPPORT_GROUP,
-        text=f"<b>{me.mention} ʀᴇsᴛᴀʀᴛᴇᴅ 🤖</b>"
-    )
-
-    app = web.AppRunner(await web_server())
-    await app.setup()
-    await web.TCPSite(app, "0.0.0.0", PORT).start()
-
-    await idle()
 
 if __name__ == "__main__":
     try:
         loop.run_until_complete(start())
     except KeyboardInterrupt:
-        logging.info("----------------------- Service Stopped -----------------------")
+        log.info("----------------------- Service Stopped -----------------------")

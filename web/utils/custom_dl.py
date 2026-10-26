@@ -1,126 +1,287 @@
+"""
+Streaming engine for the File-to-Link bot (wzgram / Pyrogram compatible).
+
+Design goals: stable speed, no half-sent files, many simultaneous users.
+
+* Every stream is split into "lanes" (striped: lane k fetches parts k, k+n, k+2n...).
+  A lane is ONE bot client / ONE Telegram media connection, with a sliding
+  window of GetFile requests in flight, so all lanes prefetch simultaneously.
+* Lane count is ADAPTIVE: with a single active stream it uses up to
+  MAX_PARALLEL_CLIENTS bots (max speed); as more users stream, each stream
+  gets fewer lanes so the bots are shared fairly (stable under load).
+* Memory is BOUNDED: a lane never holds more than `window` chunks, and the
+  window shrinks when many lanes are active (MAX_INFLIGHT_CHUNKS ~= max MB).
+* Every GetFile call has retries (FloodWait, timeouts, 5xx, broken media
+  session, expired file reference). If a chunk finally cannot be fetched the
+  stream raises, so the HTTP layer aborts the connection and the client can
+  resume with a Range request instead of silently receiving a truncated file.
+* If the low-level (raw Session) path is unavailable in the installed
+  library version, it automatically falls back to `Client.stream_media()`.
+"""
 import asyncio
 import logging
-from info import *
-from typing import Dict, Union
+import time
+from collections import OrderedDict, deque
+from contextlib import suppress
+from typing import Dict, List, Optional
+
+from info import (
+    BIN_CHANNEL,
+    FETCH_RETRIES,
+    FETCH_TIMEOUT,
+    FILE_CACHE_SIZE,
+    FLOOD_BUDGET,
+    MAX_FLOOD_SLEEP,
+    MAX_INFLIGHT_CHUNKS,
+    MAX_PARALLEL_CLIENTS,
+    MAX_REQUESTS_PER_CLIENT,
+    MIN_PARTS_PER_WORKER,
+    MIN_REQUESTS_PER_CLIENT,
+    PREFETCH_WINDOW,
+    STREAM_QUEUE_TIMEOUT,
+)
 from web.server import work_loads, multi_clients
-from pyrogram import Client, utils, raw
-from .file_properties import get_file_ids
-from pyrogram.session import Session, Auth
-from pyrogram.errors import AuthBytesInvalid
 from web.server.exceptions import FIleNotFound
+from .file_properties import get_file_ids
+
+from pyrogram import Client, utils, raw
 from pyrogram.file_id import FileId, FileType, ThumbnailSource
 
+try:  # low-level media sessions (fast path)
+    from pyrogram.session import Session, Auth
+    from pyrogram.errors import AuthBytesInvalid
+    _RAW_OK = True
+except Exception:  # pragma: no cover - depends on library version
+    Session = Auth = None  # type: ignore
+    AuthBytesInvalid = Exception  # type: ignore
+    _RAW_OK = False
+    logging.warning("Raw media sessions unavailable, using Client.stream_media() fallback")
 
-# --------------------------------------------------------------------------
-# Patch: serialize Session.restart() per Session instance.
-#
-# Pyrogram's own internals (the recv_worker / send() error handling) call
-# session.restart() automatically, as a fire-and-forget background task,
-# whenever the underlying TCP connection drops (e.g. "Connection lost",
-# "Broken pipe"). When several concurrent streams share one media Session
-# for a DC and the connection dies, more than one of these internal
-# restarts can fire for the *same* Session object at the same time. Two
-# concurrent restarts both call stop() -> await recv_task while a fresh
-# recv_worker is already waiting on the socket, producing:
-#   RuntimeError: read() called while another coroutine is already
-#   waiting for incoming data
-# This happens inside Pyrogram's own code, not ours, so no amount of
-# try/except in our streaming code can catch it. Wrapping restart() with
-# a per-instance lock ensures at most one restart runs at a time for a
-# given session, regardless of who triggers it.
-# --------------------------------------------------------------------------
-_original_session_restart = Session.restart
+log = logging.getLogger("streamer")
+
+# ----------------------------------------------------------------------------
+# Patch: serialise Session.restart() per Session instance (Pyrogram can fire
+# several internal restarts at once when a connection drops, which ends in
+# "RuntimeError: read() called while another coroutine is already waiting").
+# ----------------------------------------------------------------------------
+if _RAW_OK and not getattr(Session, "_restart_patched", False):
+    try:
+        _original_session_restart = Session.restart
+
+        async def _locked_session_restart(self, *args, **kwargs):
+            lock = self.__dict__.get("_custom_restart_lock")
+            if lock is None:
+                lock = asyncio.Lock()
+                self.__dict__["_custom_restart_lock"] = lock
+            async with lock:
+                return await _original_session_restart(self, *args, **kwargs)
+
+        Session.restart = _locked_session_restart
+        Session._restart_patched = True
+    except Exception:  # pragma: no cover
+        log.warning("Could not patch Session.restart()", exc_info=True)
+
+# ----------------------------------------------------------------------------
+# Global (process wide) counters
+# ----------------------------------------------------------------------------
+_active_streams = 0
+_active_lanes = 0
+STATS = {"bytes": 0, "streams_total": 0, "errors": 0, "retries": 0, "started": time.time()}
+
+_FILE_REF_ERRORS = {"FileReferenceExpired", "FileReferenceInvalid", "FileReferenceEmpty"}
+_SESSION_ERRORS = {"AuthBytesInvalid", "AuthKeyUnregistered", "AuthKeyInvalid", "AuthKeyDuplicated"}
+_PROPS_TTL = 20 * 60  # seconds a cached file_reference is trusted
 
 
-async def _locked_session_restart(self, *args, **kwargs):
-    lock = self.__dict__.get("_custom_restart_lock")
-    if lock is None:
-        lock = asyncio.Lock()
-        self.__dict__["_custom_restart_lock"] = lock
-    async with lock:
-        return await _original_session_restart(self, *args, **kwargs)
+def active_streams() -> int:
+    return _active_streams
 
 
-Session.restart = _locked_session_restart
+def active_lanes() -> int:
+    return _active_lanes
 
 
+def _flood_seconds(exc: Exception) -> int:
+    return int(getattr(exc, "value", None) or getattr(exc, "x", None) or 1)
+
+
+# ---- circuit breaker: a client that keeps failing is skipped for a while ----
+_bad_until: Dict[int, float] = {}
+_BAD_SECONDS = 45
+
+
+def mark_bad(idx: int) -> None:
+    if len(multi_clients) > 1:
+        _bad_until[idx] = time.time() + _BAD_SECONDS
+        log.warning("Client %s marked unhealthy for %ss", idx, _BAD_SECONDS)
+
+
+def healthy_clients() -> List[tuple]:
+    now = time.time()
+    items = [kv for kv in multi_clients.items() if _bad_until.get(kv[0], 0) <= now]
+    return items or list(multi_clients.items())
+
+
+def pick_client_index() -> int:
+    """Least-loaded healthy client."""
+    items = healthy_clients()
+    return min((i for i, _ in items), key=lambda i: work_loads.get(i, 0))
+
+
+# ============================================================================
+# Per-bot request gate (adaptive): protects a bot from FLOOD_WAIT storms
+# ============================================================================
+class _Gate:
+    """
+    * limits simultaneous GetFile calls of ONE bot (AIMD: halves on FloodWait,
+      +1 after every 25 successes, between MIN and MAX_REQUESTS_PER_CLIENT)
+    * on FloodWait pauses ALL requests of that bot until the wait is over, so
+      dozens of lanes do not retry at the same instant (thundering herd).
+    """
+
+    def __init__(self):
+        self.limit = MAX_REQUESTS_PER_CLIENT
+        self.inflight = 0
+        self.paused_until = 0.0
+        self._ok = 0
+        self._last_cut = 0.0
+        self._waiters: deque = deque()
+
+    def _wake(self):
+        room = max(1, self.limit - self.inflight)
+        while self._waiters and room > 0:
+            w = self._waiters.popleft()
+            if not w.done():
+                w.set_result(None)
+                room -= 1
+
+    async def acquire(self):
+        loop = asyncio.get_running_loop()
+        while True:
+            now = time.monotonic()
+            if now >= self.paused_until and self.inflight < self.limit:
+                self.inflight += 1
+                return
+            fut = loop.create_future()
+            self._waiters.append(fut)
+            timeout = (self.paused_until - now) if now < self.paused_until else None
+            try:
+                await asyncio.wait_for(fut, timeout)
+            except asyncio.TimeoutError:
+                pass
+            finally:
+                with suppress(ValueError):
+                    self._waiters.remove(fut)
+
+    def release(self):
+        self.inflight = max(0, self.inflight - 1)
+        self._wake()
+
+    def success(self):
+        self._ok += 1
+        if self._ok >= 25 and self.limit < MAX_REQUESTS_PER_CLIENT:
+            self.limit += 1
+            self._ok = 0
+            self._wake()
+
+    def flood(self, seconds: float) -> bool:
+        """Register a FloodWait. Returns True when this is a NEW event (for logging)."""
+        now = time.monotonic()
+        new_event = now >= self.paused_until
+        self.paused_until = max(self.paused_until, now + seconds + 0.2)
+        if now - self._last_cut > 2:
+            self.limit = max(MIN_REQUESTS_PER_CLIENT, int(self.limit * 0.6))
+            self._last_cut = now
+            self._ok = 0
+        return new_event
+
+
+# ============================================================================
+# ByteStreamer: per-client cache of file properties + media sessions
+# ============================================================================
 class ByteStreamer:
     def __init__(self, client: Client):
-        """A custom class that holds the cache of a specific client and class functions.
-        attributes:
-            client: the client that the cache is for.
-            cached_file_ids: a dict of cached file IDs.
-            cached_file_properties: a dict of cached file properties.
-
-        functions:
-            generate_file_properties: returns the properties for a media of a specific message contained in Tuple.
-            generate_media_session: returns the media session for the DC that contains the media file.
-            yield_file: yield a file from telegram servers for streaming.
-
-        This is a modified version of the <https://github.com/eyaadh/megadlbot_oss/blob/master/mega/telegram/utils/custom_download.py>
-        Thanks to Eyaadh <https://github.com/eyaadh>
-        """
-        self.clean_timer = 30 * 60
         self.client: Client = client
-        self.cached_file_ids: Dict[int, FileId] = {}
-        # One lock per DC so concurrent requests for the same file/DC can't
-        # race to create/restart the media session at the same time.
+        self._props: "OrderedDict[int, tuple]" = OrderedDict()  # id -> (ts, FileId)
+        self._inflight: Dict[int, asyncio.Task] = {}
         self._session_locks: Dict[int, asyncio.Lock] = {}
-        asyncio.create_task(self.clean_cache())
+        self.gate = _Gate()
 
-    async def get_file_properties(self, id: int) -> FileId:
-        """
-        Returns the properties of a media of a specific message in a FIleId class.
-        if the properties are cached, then it'll return the cached results.
-        or it'll generate the properties from the Message ID and cache them.
-        """
-        if id not in self.cached_file_ids:
-            await self.generate_file_properties(id)
-            logging.debug(f"Cached file properties for message with ID {id}")
-        return self.cached_file_ids[id]
+    # ---------------------------------------------------------------- props
+    def _cache_get(self, id: int) -> Optional[FileId]:
+        item = self._props.get(id)
+        if item is None:
+            return None
+        ts, fid = item
+        if time.time() - ts > _PROPS_TTL:
+            self._props.pop(id, None)
+            return None
+        self._props.move_to_end(id)
+        return fid
 
-    async def generate_file_properties(self, id: int) -> FileId:
-        """
-        Generates the properties of a media file on a specific message.
-        returns ths properties in a FIleId class.
-        """
-        file_id = await get_file_ids(self.client, BIN_CHANNEL, id)
-        logging.debug(f"Generated file ID and Unique ID for message with ID {id}")
-        if not file_id:
-            logging.debug(f"Message with ID {id} not found")
+    def _cache_put(self, id: int, fid: FileId) -> None:
+        self._props[id] = (time.time(), fid)
+        self._props.move_to_end(id)
+        while len(self._props) > FILE_CACHE_SIZE:
+            self._props.popitem(last=False)
+
+    def seed(self, id: int, fid: FileId) -> None:
+        """Store properties that were already fetched by the caller."""
+        if self._cache_get(id) is None:
+            self._cache_put(id, fid)
+
+    async def _load(self, id: int) -> FileId:
+        fid = await get_file_ids(self.client, BIN_CHANNEL, id)
+        if not fid:
             raise FIleNotFound
-        self.cached_file_ids[id] = file_id
-        logging.debug(f"Cached media message with ID {id}")
-        return self.cached_file_ids[id]
+        self._cache_put(id, fid)
+        return fid
 
-    async def generate_media_session(self, client: Client, file_id: FileId) -> Session:
-        """
-        Generates the media session for the DC that contains the media file.
-        This is required for getting the bytes from Telegram servers.
+    async def get_file_properties(self, id: int, refresh: bool = False) -> FileId:
+        """Cached + de-duplicated: 500 users opening one link = 1 Telegram call."""
+        if not refresh:
+            hit = self._cache_get(id)
+            if hit is not None:
+                return hit
+        task = self._inflight.get(id)
+        if task is None:
+            task = asyncio.create_task(self._load(id))
+            self._inflight[id] = task
 
-        Guarded by a per-DC lock: without this, several concurrent Range
-        requests (e.g. a video player buffering) can all see no cached
-        session at once and each start a brand new Session/recv_worker for
-        the same DC. The losing sessions never get stopped, and a later
-        restart on one of them races with a recv_worker that's still
-        blocked reading on the old connection, producing:
-        "RuntimeError: read() called while another coroutine is already
-        waiting for incoming data".
-        """
-        lock = self._session_locks.setdefault(file_id.dc_id, asyncio.Lock())
+            def _done(t: asyncio.Task, _id=id):
+                self._inflight.pop(_id, None)
+                if not t.cancelled():
+                    t.exception()  # mark retrieved, avoids "never retrieved" warnings
 
-        async with lock:
-            media_session = client.media_sessions.get(file_id.dc_id, None)
+            task.add_done_callback(_done)
+        return await asyncio.shield(task)
+
+    # -------------------------------------------------------- media sessions
+    def _lock(self, dc_id: int) -> asyncio.Lock:
+        return self._session_locks.setdefault(dc_id, asyncio.Lock())
+
+    async def generate_media_session(self, client: Client, file_id: FileId) -> "Session":
+        """Media session for the DC that stores the file (one per client+DC)."""
+        async with self._lock(file_id.dc_id):
+            media_session = client.media_sessions.get(file_id.dc_id)
+
+            if media_session is not None:
+                started = getattr(media_session, "is_started", None)
+                if started is not None and hasattr(started, "is_set") and not started.is_set():
+                    # dead session left behind - rebuild it
+                    client.media_sessions.pop(file_id.dc_id, None)
+                    with suppress(Exception):
+                        await asyncio.wait_for(media_session.stop(), 10)
+                    media_session = None
 
             if media_session is None:
+                test_mode = await client.storage.test_mode()
                 if file_id.dc_id != await client.storage.dc_id():
                     media_session = Session(
                         client,
                         file_id.dc_id,
-                        await Auth(
-                            client, file_id.dc_id, await client.storage.test_mode()
-                        ).create(),
-                        await client.storage.test_mode(),
+                        await Auth(client, file_id.dc_id, test_mode).create(),
+                        test_mode,
                         is_media=True,
                     )
                     await media_session.start()
@@ -129,7 +290,6 @@ class ByteStreamer:
                         exported_auth = await client.invoke(
                             raw.functions.auth.ExportAuthorization(dc_id=file_id.dc_id)
                         )
-
                         try:
                             await media_session.send(
                                 raw.functions.auth.ImportAuthorization(
@@ -138,9 +298,6 @@ class ByteStreamer:
                             )
                             break
                         except AuthBytesInvalid:
-                            logging.debug(
-                                f"Invalid authorization bytes for DC {file_id.dc_id}"
-                            )
                             continue
                     else:
                         await media_session.stop()
@@ -150,39 +307,27 @@ class ByteStreamer:
                         client,
                         file_id.dc_id,
                         await client.storage.auth_key(),
-                        await client.storage.test_mode(),
+                        test_mode,
                         is_media=True,
                     )
                     await media_session.start()
-                logging.debug(f"Created media session for DC {file_id.dc_id}")
                 client.media_sessions[file_id.dc_id] = media_session
-            else:
-                logging.debug(f"Using cached media session for DC {file_id.dc_id}")
+                log.debug("Created media session for DC %s", file_id.dc_id)
             return media_session
 
-    async def _drop_media_session(self, client: Client, dc_id: int) -> None:
-        """
-        Removes a broken media session so the next request builds a fresh
-        one, instead of every subsequent request reusing a dead connection.
-        """
-        lock = self._session_locks.setdefault(dc_id, asyncio.Lock())
-        async with lock:
-            session = client.media_sessions.pop(dc_id, None)
-            if session is not None:
-                try:
-                    await session.stop()
-                except Exception:
-                    logging.debug(f"Error while stopping broken session for DC {dc_id}", exc_info=True)
+    async def renew_media_session(self, client: Client, file_id: FileId, bad: "Session") -> "Session":
+        """Drop `bad` (only if nobody replaced it yet) and return a healthy session."""
+        async with self._lock(file_id.dc_id):
+            cur = client.media_sessions.get(file_id.dc_id)
+            if cur is not None and cur is bad:
+                client.media_sessions.pop(file_id.dc_id, None)
+                with suppress(Exception):
+                    await asyncio.wait_for(bad.stop(), 10)
+        return await self.generate_media_session(client, file_id)
 
+    # ------------------------------------------------------------- location
     @staticmethod
-    async def get_location(file_id: FileId) -> Union[
-        raw.types.InputPhotoFileLocation,
-        raw.types.InputDocumentFileLocation,
-        raw.types.InputPeerPhotoFileLocation,
-    ]:
-        """
-        Returns the file location for the media file.
-        """
+    async def get_location(file_id: FileId):
         file_type = file_id.file_type
 
         if file_type == FileType.CHAT_PHOTO:
@@ -198,166 +343,263 @@ class ByteStreamer:
                         channel_id=utils.get_channel_id(file_id.chat_id),
                         access_hash=file_id.chat_access_hash,
                     )
-
-            location = raw.types.InputPeerPhotoFileLocation(
+            return raw.types.InputPeerPhotoFileLocation(
                 peer=peer,
                 volume_id=file_id.volume_id,
                 local_id=file_id.local_id,
                 big=file_id.thumbnail_source == ThumbnailSource.CHAT_PHOTO_BIG,
             )
-        elif file_type == FileType.PHOTO:
-            location = raw.types.InputPhotoFileLocation(
+        if file_type == FileType.PHOTO:
+            return raw.types.InputPhotoFileLocation(
                 id=file_id.media_id,
                 access_hash=file_id.access_hash,
                 file_reference=file_id.file_reference,
                 thumb_size=file_id.thumbnail_size,
             )
-        else:
-            location = raw.types.InputDocumentFileLocation(
-                id=file_id.media_id,
-                access_hash=file_id.access_hash,
-                file_reference=file_id.file_reference,
-                thumb_size=file_id.thumbnail_size,
-            )
-        return location
+        return raw.types.InputDocumentFileLocation(
+            id=file_id.media_id,
+            access_hash=file_id.access_hash,
+            file_reference=file_id.file_reference,
+            thumb_size=file_id.thumbnail_size,
+        )
 
-    # How many GetFile requests to keep in flight at once per stream.
-    # Higher = more throughput (multiple 1MB chunks requested in parallel
-    # instead of one round-trip at a time), but too high can trigger
-    # Telegram flood limits on very slow/free hosts. 4-6 is a safe,
-    # noticeably faster default; tune via PREFETCH_WINDOW in info.py if needed.
-    PREFETCH_WINDOW = int(globals().get("PREFETCH_WINDOW", 8))
 
-    async def yield_file(
-        self,
-        file_id: FileId,
-        index: int,
-        offset: int,
-        first_part_cut: int,
-        last_part_cut: int,
-        part_count: int,
-        chunk_size: int,
-    ) -> Union[str, None]:
-        """
-        Custom generator that yields the bytes of the media file.
-        Modded from <https://github.com/eyaadh/megadlbot_oss/blob/master/mega/telegram/utils/custom_download.py#L20>
-        Thanks to Eyaadh <https://github.com/eyaadh>
+_streamers: Dict[Client, ByteStreamer] = {}
 
-        Speed note: instead of awaiting one GetFile round-trip at a time
-        (request -> wait -> request -> wait ...), this keeps a sliding
-        window of several requests in flight concurrently and yields the
-        results strictly in order. Chunks still arrive to the client in the
-        correct sequence, but network round-trip latency is hidden behind
-        the parallel in-flight requests, which noticeably raises effective
-        throughput per stream.
-        """
-        client = self.client
-        work_loads[index] += 1
-        logging.debug(f"Starting to yielding file with client {index}.")
-        media_session = await self.generate_media_session(client, file_id)
-        location = await self.get_location(file_id)
 
-        offsets = [offset + i * chunk_size for i in range(part_count)]
-        window = max(1, self.PREFETCH_WINDOW)
+def get_byte_streamer(client: Client) -> ByteStreamer:
+    s = _streamers.get(client)
+    if s is None:
+        s = _streamers[client] = ByteStreamer(client)
+    return s
 
-        async def fetch(off: int) -> bytes:
-            r = await media_session.send(
-                raw.functions.upload.GetFile(location=location, offset=off, limit=chunk_size)
-            )
-            return r.bytes if isinstance(r, raw.types.upload.File) else b""
 
-        pending: Dict[int, asyncio.Task] = {}
-        next_to_fetch = 0
-        next_to_yield = 0
+# ============================================================================
+# One lane = one client + one contiguous range of parts
+# ============================================================================
+class _Lane:
+    """
+    One client + the parts it is responsible for. Parts are STRIPED across lanes
+    (lane k gets parts k, k+n, k+2n ...), so while the consumer reads part i from
+    lane i % n, all lanes keep prefetching ahead at the same time.
+    """
 
-        def _fill_pipeline():
-            nonlocal next_to_fetch
-            while next_to_fetch < len(offsets) and len(pending) < window:
-                pending[next_to_fetch] = asyncio.create_task(fetch(offsets[next_to_fetch]))
-                next_to_fetch += 1
+    def __init__(self, idx: int, client: Client, file_row: int, parts: List[int],
+                 offset: int, chunk_size: int, window: int):
+        self.idx = idx
+        self.client = client
+        self.streamer = get_byte_streamer(client)
+        self.id = file_row
+        self.parts = parts
+        self.count = len(parts)
+        self.offset = offset
+        self.chunk_size = chunk_size
+        self.window = window
+        self.slots = asyncio.Semaphore(window)       # back-pressure
+        self.queue: asyncio.Queue = asyncio.Queue()  # ordered futures/tasks
+        self.tasks: List[asyncio.Future] = []
+        self.runner: Optional[asyncio.Task] = None
+        self.file_id: Optional[FileId] = None
+        self.location = None
+        self.session = None
 
-        try:
-            _fill_pipeline()
-            while next_to_yield < len(offsets):
-                task = pending.pop(next_to_yield)
-                chunk = await task
-                _fill_pipeline()
+    # ----------------------------------------------------------------- fetch
+    async def _setup(self):
+        self.file_id = await self.streamer.get_file_properties(self.id)
+        self.location = await self.streamer.get_location(self.file_id)
+        self.session = await self.streamer.generate_media_session(self.client, self.file_id)
 
-                if not chunk:
-                    break
+    async def _renew_session(self):
+        self.session = await self.streamer.renew_media_session(
+            self.client, self.file_id, self.session
+        )
 
-                current_part = next_to_yield + 1
-                if part_count == 1:
-                    yield chunk[first_part_cut:last_part_cut]
-                elif current_part == 1:
-                    yield chunk[first_part_cut:]
-                elif current_part == part_count:
-                    yield chunk[:last_part_cut]
+    async def _fetch(self, off: int) -> bytes:
+        gate = self.streamer.gate
+        last: Optional[BaseException] = None
+        attempt = 0
+        flood_left = FLOOD_BUDGET
+        while attempt < FETCH_RETRIES:
+            action = None
+            await gate.acquire()
+            try:
+                r = await asyncio.wait_for(
+                    self.session.send(
+                        raw.functions.upload.GetFile(
+                            location=self.location, offset=off, limit=self.chunk_size
+                        )
+                    ),
+                    FETCH_TIMEOUT,
+                )
+                gate.success()
+                return r.bytes if isinstance(r, raw.types.upload.File) else b""
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                last = e
+                name = type(e).__name__
+                STATS["retries"] += 1
+                if name in ("FloodWait", "FloodPremiumWait"):
+                    wait = _flood_seconds(e)
+                    if gate.flood(wait):
+                        log.warning("FloodWait %ss on client %s -> pausing it, limit now %s",
+                                    wait, self.idx, gate.limit)
+                    flood_left -= wait
+                    if wait > MAX_FLOOD_SLEEP or flood_left < 0:
+                        raise
+                    continue          # does not use a retry; the gate holds everyone back
+                attempt += 1
+                if name in _FILE_REF_ERRORS:
+                    action = ("ref", 0)
+                elif isinstance(e, (asyncio.TimeoutError, TimeoutError)) or getattr(e, "CODE", 0) >= 500:
+                    # NOTE: checked before OSError because TimeoutError is an OSError
+                    action = ("renew" if attempt >= 2 else "sleep", min(0.3 * (2 ** attempt), 3))
+                elif name in _SESSION_ERRORS or isinstance(e, (ConnectionError, OSError, RuntimeError)):
+                    action = ("renew", min(0.3 * (2 ** attempt), 3))
                 else:
-                    yield chunk
+                    raise
+            finally:
+                gate.release()
 
-                next_to_yield += 1
-        except (TimeoutError, AttributeError):
-            pass
-        except (ConnectionError, OSError, RuntimeError) as e:
-            # The underlying connection/session is in a bad state (e.g. the
-            # "read() called while another coroutine is already waiting"
-            # race, or a dropped socket). Drop it so the next request
-            # rebuilds a fresh session instead of reusing a dead one.
-            logging.warning(f"Media session for DC {file_id.dc_id} appears broken, dropping it: {e}")
-            await self._drop_media_session(client, file_id.dc_id)
+            # recovery happens OUTSIDE the gate so it never blocks other requests
+            kind, delay = action
+            if kind == "ref":
+                self.file_id = await self.streamer.get_file_properties(self.id, refresh=True)
+                self.location = await self.streamer.get_location(self.file_id)
+            elif kind == "renew":
+                await self._renew_session()
+            if delay:
+                await asyncio.sleep(delay)
+        raise last if last else RuntimeError("fetch failed")
+
+    # --------------------------------------------------------------- runners
+    async def _push_error(self, exc: BaseException):
+        fut = asyncio.get_running_loop().create_future()
+        fut.set_exception(exc)
+        fut.exception()  # silence "never retrieved" if the consumer is already gone
+        await self.queue.put(fut)
+
+    async def _run_raw(self):
+        try:
+            await self._setup()
+            for p in self.parts:
+                await self.slots.acquire()
+                t = asyncio.ensure_future(self._fetch(self.offset + p * self.chunk_size))
+                self.tasks.append(t)
+                await self.queue.put(t)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            await self._push_error(e)
         finally:
-            for t in pending.values():
-                t.cancel()
-            logging.debug(f"Finished yielding file, served up to part {next_to_yield}.")
-            work_loads[index] -= 1
+            await self.queue.put(None)
 
-    async def clean_cache(self) -> None:
-        """
-        function to clean the cache to reduce memory usage
-        """
+    async def _run_fallback(self):
+        """Client.stream_media() path (sequential, but always compatible)."""
+        try:
+            fid = await self.streamer.get_file_properties(self.id)
+            ref = getattr(fid, "file_id_str", None)
+            if not ref:
+                raise RuntimeError("file_id_str missing for fallback streaming")
+            start_chunk = (self.offset // self.chunk_size) + self.parts[0]  # contiguous (single lane)
+            async for chunk in self.client.stream_media(ref, offset=start_chunk, limit=self.count):
+                await self.slots.acquire()
+                fut = asyncio.get_running_loop().create_future()
+                fut.set_result(chunk)
+                await self.queue.put(fut)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            await self._push_error(e)
+        finally:
+            await self.queue.put(None)
+
+    def start(self, use_raw: bool):
+        self.runner = asyncio.create_task(self._run_raw() if use_raw else self._run_fallback())
+
+    async def close(self):
+        pending = [t for t in self.tasks if not t.done()]
+        if self.runner and not self.runner.done():
+            pending.append(self.runner)
+        for t in pending:
+            t.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        for t in self.tasks:  # retrieve exceptions of finished-but-unused tasks
+            if t.done() and not t.cancelled():
+                t.exception()
+
+
+def compute_geometry(from_bytes: int, until_bytes: int, chunk_size: int = 1024 * 1024):
+    """Byte range (inclusive) -> (offset, first_part_cut, last_part_cut, part_count)."""
+    offset = from_bytes - (from_bytes % chunk_size)
+    first_part_cut = from_bytes - offset
+    last_part_cut = until_bytes % chunk_size + 1
+    part_count = until_bytes // chunk_size - offset // chunk_size + 1
+    return offset, first_part_cut, last_part_cut, part_count
+
+
+class Busy(Exception):
+    """Server is saturated: no buffer budget became free in time (HTTP layer answers 503)."""
+
+
+class _Budget:
+    """
+    Strict global pool of 1 MB chunk slots. A stream reserves ALL of its slots at once
+    (lanes x window) before it starts and gives them back when it ends, so the RAM used by
+    streaming can never exceed `total` MB, and there is no hold-and-wait deadlock.
+    """
+
+    def __init__(self, total: int):
+        self.total = total
+        self.free = total
+        self._waiters: deque = deque()
+
+    async def reserve(self, want_lanes: int, want_window: int, streams: int, timeout: float):
+        loop = asyncio.get_running_loop()
+        deadline = time.monotonic() + timeout
         while True:
-            await asyncio.sleep(self.clean_timer)
-            self.cached_file_ids.clear()
-            logging.debug("Cleaned the cache")
+            if self.free >= 1:
+                # fair share: no single stream may swallow the pool while others are active
+                cap = max(2, min(self.free, self.total // max(1, streams)))
+                cap = min(cap, self.free)
+                lanes = max(1, min(want_lanes, cap // 2 if cap >= 2 else 1))
+                window = max(min(2, want_window), min(want_window, cap // lanes))
+                tokens = lanes * window
+                if tokens <= self.free:
+                    self.free -= tokens
+                    return lanes, window, tokens
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise Busy
+            fut = loop.create_future()
+            self._waiters.append(fut)
+            try:
+                await asyncio.wait_for(fut, remaining)
+            except asyncio.TimeoutError:
+                raise Busy
+            finally:
+                with suppress(ValueError):
+                    self._waiters.remove(fut)
+
+    def release(self, tokens: int):
+        self.free = min(self.total, self.free + tokens)
+        while self._waiters:
+            w = self._waiters.popleft()
+            if not w.done():
+                w.set_result(None)
 
 
-# ==========================================================================
-# Multi-client parallel streaming
-#
-# yield_file() above pipelines multiple chunk requests on ONE client's
-# connection. That helps hide round-trip latency, but it's still capped by
-# whatever throughput a single Telegram bot session/connection can push.
-#
-# parallel_yield_file() goes a step further: it splits the requested byte
-# range into contiguous groups and fetches each group over a DIFFERENT
-# client (a different bot account = a different TCP connection to
-# Telegram), all running concurrently. Each group is still internally
-# pipelined. Results are streamed back to the caller strictly in order via
-# small per-worker queues, so playback/download starts immediately and
-# workers 2..N keep fetching ahead in the background while worker 1's
-# output is being sent to the browser.
-#
-# This only helps when a single connection's speed is the bottleneck (not
-# when the server's own outbound bandwidth is the limit).
-# ==========================================================================
-
-# How many client connections to use in parallel for one stream.
-# Bounded by however many bot accounts (multi-clients) are configured.
-MAX_PARALLEL_CLIENTS = int(globals().get("MAX_PARALLEL_CLIENTS", 4))
-
-_byte_streamer_cache: Dict[Client, "ByteStreamer"] = {}
+_budget = _Budget(MAX_INFLIGHT_CHUNKS)
 
 
-def _get_byte_streamer(client: Client) -> "ByteStreamer":
-    streamer = _byte_streamer_cache.get(client)
-    if streamer is None:
-        streamer = ByteStreamer(client)
-        _byte_streamer_cache[client] = streamer
-    return streamer
+# ============================================================================
+# Public generator used by the HTTP layer
+# ============================================================================
+_raw_broken = False
 
 
-async def parallel_yield_file(
+async def stream_file(
     primary_index: int,
     primary_file_id: FileId,
     id: int,
@@ -368,117 +610,101 @@ async def parallel_yield_file(
     chunk_size: int,
 ):
     """
-    Splits [offset, offset + part_count*chunk_size) across several client
-    connections and streams the results back in the correct order.
-    Falls back to effectively the same behaviour as yield_file() when only
-    one client is configured.
+    Yield the bytes of `part_count` parts starting at `offset`
+    (first part trimmed by first_part_cut, last part by last_part_cut).
+    Raises on unrecoverable failure so the caller can abort the connection.
     """
-    ordered_clients = [multi_clients[primary_index]] + [
-        c for i, c in multi_clients.items() if i != primary_index
-    ]
+    global _active_streams, _active_lanes, _raw_broken
 
-    n_workers = max(1, min(MAX_PARALLEL_CLIENTS, len(ordered_clients), part_count))
-    workers_clients = ordered_clients[:n_workers]
-
-    # Avoid making the primary client re-fetch file properties it (or the
-    # caller) already looked up moments ago.
-    primary_streamer = _get_byte_streamer(workers_clients[0])
-    primary_streamer.cached_file_ids[id] = primary_file_id
-
-    # Split part indices [0, part_count) into n_workers contiguous groups.
-    base, rem = divmod(part_count, n_workers)
-    groups = []
-    start = 0
-    for w in range(n_workers):
-        size = base + (1 if w < rem else 0)
-        if size == 0:
-            continue
-        groups.append((start, start + size))
-        start += size
-
-    window = max(1, ByteStreamer.PREFETCH_WINDOW)
-    queues = [asyncio.Queue(maxsize=window) for _ in groups]
-
-    def _client_index(client: Client) -> int:
-        for i, c in multi_clients.items():
-            if c is client:
-                return i
-        return primary_index
-
-    async def producer(qi: int, client: Client, start_part: int, end_part: int):
-        q = queues[qi]
-        streamer = _get_byte_streamer(client)
-        idx = _client_index(client)
-        work_loads[idx] = work_loads.get(idx, 0) + 1
-        try:
-            file_id = await streamer.get_file_properties(id)
-            location = await streamer.get_location(file_id)
-            media_session = await streamer.generate_media_session(client, file_id)
-
-            part_offsets = [offset + i * chunk_size for i in range(start_part, end_part)]
-
-            async def fetch(off: int) -> bytes:
-                r = await media_session.send(
-                    raw.functions.upload.GetFile(location=location, offset=off, limit=chunk_size)
-                )
-                return r.bytes if isinstance(r, raw.types.upload.File) else b""
-
-            pending: Dict[int, asyncio.Task] = {}
-            next_to_fetch = 0
-            next_to_put = 0
-
-            def _fill():
-                nonlocal next_to_fetch
-                while next_to_fetch < len(part_offsets) and len(pending) < window:
-                    pending[next_to_fetch] = asyncio.create_task(fetch(part_offsets[next_to_fetch]))
-                    next_to_fetch += 1
-
-            _fill()
-            while next_to_put < len(part_offsets):
-                task = pending.pop(next_to_put)
-                chunk = await task
-                _fill()
-                await q.put(chunk)
-                if not chunk:
-                    break
-                next_to_put += 1
-        except (TimeoutError, AttributeError):
-            pass
-        except (ConnectionError, OSError, RuntimeError) as e:
-            logging.warning(f"Parallel worker (client {idx}) failed: {e}")
-            try:
-                fid = await streamer.get_file_properties(id)
-                await streamer._drop_media_session(client, fid.dc_id)
-            except Exception:
-                logging.debug("Could not drop broken session for failed worker", exc_info=True)
-        finally:
-            await q.put(None)  # sentinel: this worker's output is finished
-            work_loads[idx] = max(0, work_loads.get(idx, 1) - 1)
-
-    producer_tasks = [
-        asyncio.create_task(producer(i, workers_clients[i], g[0], g[1]))
-        for i, g in enumerate(groups)
-    ]
-
+    _active_streams += 1
+    STATS["streams_total"] += 1
+    lanes: List[_Lane] = []
+    reserved = 0
     try:
-        global_part = 0
-        for qi in range(len(groups)):
-            q = queues[qi]
-            while True:
-                chunk = await q.get()
-                if chunk is None:
-                    break
-                if not chunk:
-                    return
-                if part_count == 1:
-                    yield chunk[first_part_cut:last_part_cut]
-                elif global_part == 0:
-                    yield chunk[first_part_cut:]
-                elif global_part == part_count - 1:
-                    yield chunk[:last_part_cut]
-                else:
-                    yield chunk
-                global_part += 1
+        # ---- choose clients: least loaded first, primary first on ties
+        ordered = sorted(
+            healthy_clients(),
+            key=lambda kv: (work_loads.get(kv[0], 0), 0 if kv[0] == primary_index else 1),
+        )
+        n_clients = len(ordered)
+        fair = max(1, n_clients // max(1, _active_streams))
+        n_workers = max(
+            1,
+            min(MAX_PARALLEL_CLIENTS, n_clients, fair, max(1, part_count // MIN_PARTS_PER_WORKER)),
+        )
+        chosen = ordered[:n_workers]
+
+        # the primary client's properties were fetched by the caller already
+        for cidx, client in chosen:
+            if cidx == primary_index:
+                get_byte_streamer(client).seed(id, primary_file_id)
+
+        use_raw = _RAW_OK and not _raw_broken
+        if not use_raw:                       # stream_media() can only read contiguous ranges
+            n_workers = 1
+            chosen = chosen[:1]
+
+        want_window = max(1, min(PREFETCH_WINDOW, -(-part_count // n_workers)))
+        got_lanes, window, tokens = await _budget.reserve(
+            n_workers, want_window, _active_streams, STREAM_QUEUE_TIMEOUT
+        )
+        reserved = tokens
+        n_workers = got_lanes
+        chosen = chosen[:n_workers]
+
+        for w, (cidx, client) in enumerate(chosen):
+            parts = list(range(w, part_count, n_workers)) if use_raw else list(range(part_count))
+            if not parts:
+                continue
+            lanes.append(_Lane(cidx, client, id, parts, offset, chunk_size, window))
+            _active_lanes += 1
+            work_loads[cidx] = work_loads.get(cidx, 0) + 1
+
+        for lane in lanes:
+            lane.start(use_raw)
+
+        # ---- consume parts strictly in order (part i comes from lane i % n)
+        n_lanes = len(lanes)
+        for global_part in range(part_count):
+            lane = lanes[global_part % n_lanes]
+            item = await lane.queue.get()
+            if item is None:
+                raise ConnectionError(f"Lane {lane.idx} ended early at part {global_part}/{part_count}")
+            try:
+                chunk = await item
+            except Exception as e:
+                mark_bad(lane.idx)
+                if use_raw and isinstance(e, (AttributeError, TypeError, ImportError, NotImplementedError)):
+                    _raw_broken = True
+                    log.error("Raw streaming path broken (%r) - switching to fallback", e)
+                raise
+            if not chunk:
+                raise ConnectionError("Telegram returned an empty chunk before EOF")
+
+            if part_count == 1:
+                out = chunk[first_part_cut:last_part_cut]
+            elif global_part == 0:
+                out = chunk[first_part_cut:]
+            elif global_part == part_count - 1:
+                out = chunk[:last_part_cut]
+            else:
+                out = chunk
+
+            STATS["bytes"] += len(out)
+            yield out
+            lane.slots.release()
+    except Exception:
+        STATS["errors"] += 1
+        raise
     finally:
-        for t in producer_tasks:
-            t.cancel()
+        for lane in lanes:
+            await lane.close()
+            _active_lanes = max(0, _active_lanes - 1)
+            work_loads[lane.idx] = max(0, work_loads.get(lane.idx, 1) - 1)
+        if reserved:
+            _budget.release(reserved)
+        _active_streams = max(0, _active_streams - 1)
+
+
+# Backwards compatible name used by older code
+parallel_yield_file = stream_file
