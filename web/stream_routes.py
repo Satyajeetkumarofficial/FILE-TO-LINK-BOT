@@ -13,12 +13,14 @@ from info import (
     BOT_USERNAME,
     MAX_CONCURRENT_STREAMS,
     MAX_STREAMS_PER_IP,
+    MEM_SHED_RATIO,
     STALL_TIMEOUT,
     STREAM_QUEUE_TIMEOUT,
     SETTINGS_CACHE_TTL,
 )
 from web.server import multi_clients, work_loads
 from web.server.exceptions import FIleNotFound, InvalidHash
+import memguard
 from database.users_db import db
 from web.utils.custom_dl import (
     Busy, get_byte_streamer, stream_file, compute_geometry, active_streams, active_lanes,
@@ -111,6 +113,8 @@ async def root_route_handler(_):
         "active_lanes": active_lanes(),
         "waiting": _waiting,
         "served_mb": round(STATS["bytes"] / 1048576, 1),
+        "memory_mb": round(memguard.rss_mb()),
+        "memory_limit_mb": memguard.limit_mb(),
         "errors": STATS["errors"],
         "retries": STATS["retries"],
         "version": __version__,
@@ -248,6 +252,10 @@ async def media_streamer(request: web.Request, id: int, secure_hash: str):
         return web.Response(status=status, headers=headers)
 
     # ---- admission control: protects RAM / bandwidth when many users arrive
+    if memguard.pressure() > MEM_SHED_RATIO:
+        memguard.trim()
+        return web.Response(status=503, text="Server memory is full, please retry in a few seconds",
+                            headers={"Retry-After": "5"})
     ip = request.headers.get("CF-Connecting-IP") or _client_ip(request)
     if MAX_STREAMS_PER_IP and _per_ip.get(ip, 0) >= MAX_STREAMS_PER_IP:
         return web.Response(status=429, text="Too many parallel downloads from your IP",
