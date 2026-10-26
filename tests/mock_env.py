@@ -236,6 +236,6 @@ web_stub = _mod("aiohttp.web",
                 HTTPForbidden=type("HTTPForbidden", (_HTTPExc,), {}),
                 HTTPNotFound=type("HTTPNotFound", (_HTTPExc,), {}),
                 HTTPBadRequest=type("HTTPBadRequest", (_HTTPExc,), {}),
-                Application=object, json_response=lambda *a, **k: None)
+                Application=object, json_response=lambda *a, **k: None, middleware=lambda f: f)
 aio.web = web_stub
 aio.http_exceptions = _mod("aiohttp.http_exceptions", BadStatusLine=type("BadStatusLine", (Exception,), {}))
