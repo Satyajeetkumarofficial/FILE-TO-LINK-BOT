@@ -118,6 +118,8 @@ STREAM_QUEUE_TIMEOUT = max(1, _env_int("STREAM_QUEUE_TIMEOUT", 20))
 # HARD global cap on 1 MB chunks buffered/in flight across ALL streams (= max RAM for
 # streaming in MB). Every stream reserves its share first; if the pool is empty it waits.
 MAX_INFLIGHT_CHUNKS = max(8, _env_int("MAX_INFLIGHT_CHUNKS", 64))
+# A stream that gets no data from Telegram for this long is aborted (frees its slots).
+STALL_TIMEOUT = max(10, _env_int("STALL_TIMEOUT", 45))
 # One GetFile call: retries and per-attempt timeout (seconds).
 FETCH_RETRIES = max(1, _env_int("FETCH_RETRIES", 5))
 FETCH_TIMEOUT = max(5, _env_int("FETCH_TIMEOUT", 30))
