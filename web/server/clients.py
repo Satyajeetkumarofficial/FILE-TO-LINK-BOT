@@ -2,7 +2,7 @@ import asyncio
 import logging
 
 import session_store
-from info import API_ID, API_HASH, BOT_TOKEN, SLEEP_THRESHOLD
+from info import API_ID, API_HASH, BOT_TOKEN, SLEEP_THRESHOLD, MAX_CLIENTS, MEMORY_LIMIT_MB
 from pyrogram import Client
 from web.utils.config_parser import TokenParser
 from web.server import multi_clients, work_loads, StreamBot
@@ -70,6 +70,15 @@ async def initialize_clients():
             continue
         seen.add(t)
         unique[cid] = t
+
+    if MAX_CLIENTS and len(unique) > MAX_CLIENTS - 1:
+        keep = list(unique.items())[: max(0, MAX_CLIENTS - 1)]
+        log.warning(
+            "RAM limit %s MB: using only %s of %s bot clients (set MAX_CLIENTS to change). Extra tokens ignored: %s",
+            int(MEMORY_LIMIT_MB) if MEMORY_LIMIT_MB else "?", MAX_CLIENTS, len(unique) + 1,
+            [k for k in unique if k not in dict(keep)],
+        )
+        unique = dict(keep)
 
     if not unique:
         log.warning("No additional clients found, using the default client only")
