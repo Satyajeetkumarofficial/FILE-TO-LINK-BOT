@@ -38,6 +38,7 @@ from info import (
     MIN_PARTS_PER_WORKER,
     MIN_REQUESTS_PER_CLIENT,
     PREFETCH_WINDOW,
+    STREAM_QUEUE_TIMEOUT,
 )
 from web.server import work_loads, multi_clients
 from web.server.exceptions import FIleNotFound
@@ -538,6 +539,60 @@ def compute_geometry(from_bytes: int, until_bytes: int, chunk_size: int = 1024 *
     return offset, first_part_cut, last_part_cut, part_count
 
 
+class Busy(Exception):
+    """Server is saturated: no buffer budget became free in time (HTTP layer answers 503)."""
+
+
+class _Budget:
+    """
+    Strict global pool of 1 MB chunk slots. A stream reserves ALL of its slots at once
+    (lanes x window) before it starts and gives them back when it ends, so the RAM used by
+    streaming can never exceed `total` MB, and there is no hold-and-wait deadlock.
+    """
+
+    def __init__(self, total: int):
+        self.total = total
+        self.free = total
+        self._waiters: deque = deque()
+
+    async def reserve(self, want_lanes: int, want_window: int, streams: int, timeout: float):
+        loop = asyncio.get_running_loop()
+        deadline = time.monotonic() + timeout
+        while True:
+            if self.free >= 1:
+                # fair share: no single stream may swallow the pool while others are active
+                cap = max(2, min(self.free, self.total // max(1, streams)))
+                cap = min(cap, self.free)
+                lanes = max(1, min(want_lanes, cap // 2 if cap >= 2 else 1))
+                window = max(min(2, want_window), min(want_window, cap // lanes))
+                tokens = lanes * window
+                if tokens <= self.free:
+                    self.free -= tokens
+                    return lanes, window, tokens
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise Busy
+            fut = loop.create_future()
+            self._waiters.append(fut)
+            try:
+                await asyncio.wait_for(fut, remaining)
+            except asyncio.TimeoutError:
+                raise Busy
+            finally:
+                with suppress(ValueError):
+                    self._waiters.remove(fut)
+
+    def release(self, tokens: int):
+        self.free = min(self.total, self.free + tokens)
+        while self._waiters:
+            w = self._waiters.popleft()
+            if not w.done():
+                w.set_result(None)
+
+
+_budget = _Budget(MAX_INFLIGHT_CHUNKS)
+
+
 # ============================================================================
 # Public generator used by the HTTP layer
 # ============================================================================
@@ -564,6 +619,7 @@ async def stream_file(
     _active_streams += 1
     STATS["streams_total"] += 1
     lanes: List[_Lane] = []
+    reserved = 0
     try:
         # ---- choose clients: least loaded first, primary first on ties
         ordered = sorted(
@@ -588,7 +644,13 @@ async def stream_file(
             n_workers = 1
             chosen = chosen[:1]
 
-        window = max(2, min(PREFETCH_WINDOW, MAX_INFLIGHT_CHUNKS // max(1, _active_lanes + n_workers)))
+        want_window = max(1, min(PREFETCH_WINDOW, -(-part_count // n_workers)))
+        got_lanes, window, tokens = await _budget.reserve(
+            n_workers, want_window, _active_streams, STREAM_QUEUE_TIMEOUT
+        )
+        reserved = tokens
+        n_workers = got_lanes
+        chosen = chosen[:n_workers]
 
         for w, (cidx, client) in enumerate(chosen):
             parts = list(range(w, part_count, n_workers)) if use_raw else list(range(part_count))
@@ -639,6 +701,8 @@ async def stream_file(
             await lane.close()
             _active_lanes = max(0, _active_lanes - 1)
             work_loads[lane.idx] = max(0, work_loads.get(lane.idx, 1) - 1)
+        if reserved:
+            _budget.release(reserved)
         _active_streams = max(0, _active_streams - 1)
 
 
