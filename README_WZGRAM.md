@@ -22,17 +22,23 @@
 |---|---|---|
 | `PREFETCH_WINDOW` | 5 | GetFile requests in flight per bot (4-8) |
 | `MAX_PARALLEL_CLIENTS` | 4 | bots used for one stream when the server is idle |
-| `MAX_CONCURRENT_STREAMS` | 100 | open streams; extra users wait `STREAM_QUEUE_TIMEOUT`s then get 503 |
+| `MAX_CONCURRENT_STREAMS` | 40 | open streams; extra users wait `STREAM_QUEUE_TIMEOUT`s then get 503 |
 | `MAX_STREAMS_PER_IP` | 0 (off) | per-IP parallel connections; leave off behind Cloudflare/proxy |
 | `LOG_REQUESTS` | errors | `errors` = log only status>=400, `all`, or `off` |
-| `MAX_INFLIGHT_CHUNKS` | 128 | approx. RAM budget in MB for buffers |
+| `MAX_INFLIGHT_CHUNKS` | 64 | HARD RAM budget (MB) for stream buffers; streams wait/503 when it is used up |
 | `FETCH_RETRIES` / `FETCH_TIMEOUT` | 5 / 30 | per-chunk retries / seconds |
 | `MAX_REQUESTS_PER_CLIENT` | 16 | max parallel GetFile per bot; auto-shrinks on FloodWait, grows back slowly |
 | `MIN_REQUESTS_PER_CLIENT` | 3 | lowest value the limit may shrink to |
 | `FLOOD_BUDGET` | 90 | seconds a chunk may wait out FloodWaits before the stream is aborted |
 | `WORKERS` | 50 | bot handler concurrency |
 
-Small host (512 MB): `MAX_CONCURRENT_STREAMS=40 MAX_INFLIGHT_CHUNKS=64`. Big host: raise both.
+Small host (512 MB, e.g. Koyeb free): keep the defaults and use only **2-3 extra bots** (each bot costs RAM).
+Big host: raise `MAX_INFLIGHT_CHUNKS` (e.g. 256) and `MAX_CONCURRENT_STREAMS`.
+
+## Logins are stored in MongoDB (collection `bot_sessions`)
+Restarts/redeploys/OOM-kills reuse the stored login, so Telegram's `FLOOD_WAIT ... auth.ImportBotAuthorization`
+(crash-loop after many fresh logins) no longer happens. If a login FloodWait does occur the web server stays up and
+the bot waits it out. Treat that collection like a password (anyone with it can act as your bots).
 
 ## Testing
 - `python tests/test_engine.py` — engine test against a mock Telegram (correct bytes, ranges, errors, 80 users, disconnects, leaks).

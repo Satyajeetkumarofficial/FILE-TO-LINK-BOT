@@ -59,6 +59,7 @@ from web import web_server, check_expired_premium         # noqa: E402
 from web.server import StreamBot, multi_clients           # noqa: E402
 from web.server.clients import initialize_clients         # noqa: E402
 from utils import Temp, ping_server                       # noqa: E402
+import session_store                                      # noqa: E402
 
 log = logging.getLogger("bot")
 
@@ -85,10 +86,49 @@ async def _notify(chat_id, text):
         log.warning("Could not notify %s: %r", chat_id, e)
 
 
+async def _login_main():
+    """Start the main bot re-using its stored login; survive login FloodWaits."""
+    stored = await session_store.load(BOT_TOKEN)
+    if stored:
+        try:  # swap the (ephemeral) file session for the stored one
+            from pyrogram.storage import MemoryStorage
+            StreamBot.storage = MemoryStorage(StreamBot.name, stored)
+            log.info("Using stored login for the main bot")
+        except Exception as e:
+            log.warning("Could not apply stored login (%r) - normal login", e)
+            stored = None
+
+    for attempt in range(8):
+        try:
+            await StreamBot.start()          # also loads everything in /plugins
+            if not stored:
+                await session_store.save(BOT_TOKEN, StreamBot)
+            return
+        except Exception as e:
+            wait = session_store.is_flood(e)
+            if wait:
+                log.error("Telegram login FloodWait %ss - waiting it out (web server stays up)", wait)
+                await asyncio.sleep(wait + 5)
+                continue
+            if type(e).__name__ in session_store.BAD_SESSION and stored:
+                log.warning("Stored login rejected - forgetting it, using a fresh login")
+                await session_store.forget(BOT_TOKEN)
+                stored = None
+                raise SystemExit("Stored login was invalid; restart once to log in fresh")
+            raise
+    raise SystemExit("Could not log in to Telegram")
+
+
 async def start():
     print("\nInitializing Your Bot")
 
-    await StreamBot.start()          # also loads everything in /plugins
+    # web server FIRST: platform health checks pass while the bot logs in
+    runner = web.AppRunner(await web_server(), access_log=None, keepalive_timeout=75)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", PORT, backlog=2048).start()
+    log.info("Web server listening on port %s", PORT)
+
+    await _login_main()
     await initialize_clients()
 
     me = await StreamBot.get_me()
@@ -96,12 +136,7 @@ async def start():
     Temp.ME = me.id
     Temp.U_NAME = me.username
     Temp.B_NAME = me.first_name
-
-    # web server first, so platform health checks pass immediately
-    runner = web.AppRunner(await web_server(), access_log=None, keepalive_timeout=75)
-    await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", PORT, backlog=2048).start()
-    log.info("Web server listening on port %s (%s bot clients)", PORT, len(multi_clients))
+    log.info("Bot @%s ready with %s bot client(s)", me.username, len(multi_clients))
 
     tasks = [asyncio.create_task(_supervise("premium-check", check_expired_premium, StreamBot))]
     if ON_HEROKU:
