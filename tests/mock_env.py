@@ -211,7 +211,7 @@ for name in ("aiohttp", "pytz", "motor", "motor.motor_asyncio", "aiofiles", "sho
             sys.modules[name] = types.ModuleType(name)
 sys.modules["motor.motor_asyncio"].AsyncIOMotorClient = lambda *a, **k: SimpleNamespace(
     __getitem__=lambda s, k: SimpleNamespace())
-db_mod = _mod("database.users_db", db=SimpleNamespace())
+db_mod = _mod("database.users_db", db=SimpleNamespace(), mydb=SimpleNamespace(bot_sessions=None))
 sys.modules.setdefault("database", types.ModuleType("database"))
 sys.modules["database"].users_db = db_mod
 aio = sys.modules["aiohttp"]

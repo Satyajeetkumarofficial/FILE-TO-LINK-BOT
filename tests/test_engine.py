@@ -50,7 +50,8 @@ def expected(from_b, until_b):
 
 
 def idle_state():
-    return (dl.active_streams() == 0 and dl.active_lanes() == 0 and all(v == 0 for v in work_loads.values()))
+    return (dl.active_streams() == 0 and dl.active_lanes() == 0 and all(v == 0 for v in work_loads.values())
+            and dl._budget.free == dl._budget.total)
 
 
 async def leftover_tasks():
@@ -146,7 +147,7 @@ async def main():
     res = await asyncio.gather(*[get_stream(a, b, index=min(work_loads, key=work_loads.get)) for a, b in jobs])
     good = sum(1 for (a, b), r in zip(jobs, res) if r == expected(a, b))
     check(f"80 concurrent users, all bytes correct", good == 80, f"{good}/80 in {time.time()-t:.1f}s")
-    check("peak parallel GetFile requests stayed bounded", M.COUNTERS["max_inflight"] <= 260,
+    check("peak parallel GetFile requests stayed within the RAM budget", M.COUNTERS["max_inflight"] <= dl._budget.total,
           f"peak={M.COUNTERS['max_inflight']}")
     left = await leftover_tasks()
     check("no leaked tasks / counters after the burst", idle_state() and not left, f"leftover={len(left)}")
@@ -220,6 +221,38 @@ async def main():
     check("gate kept parallel calls near the safe level", gate.limit <= 10 or gate.limit < dl.MAX_REQUESTS_PER_CLIENT,
           f"peak={M.COUNTERS['max_inflight']}")
     check("state clean after flood storm", idle_state())
+
+    # 14 --------------------------------------------------------------- strict RAM budget (the OOM case)
+    setup_clients(6)
+    dl._budget = dl._Budget(16)                      # pretend a tiny server: 16 MB for streaming
+    M.COUNTERS["max_inflight"] = 0
+    big = [(random.randrange(0, 20 * CH), None) for _ in range(60)]
+    big = [(a, a + random.randrange(2, 12) * CH) for a, _ in big]
+    t0 = time.time()
+    res = await asyncio.gather(*[get_stream(a, b, index=dl.pick_client_index()) for a, b in big],
+                               return_exceptions=True)
+    good = sum(1 for (a, b), r in zip(big, res) if not isinstance(r, Exception) and r == expected(a, b))
+    check("60 big parallel streams with only 16 MB budget: all finish, no deadlock", good == 60,
+          f"{good}/60 in {time.time()-t0:.1f}s")
+    check("buffers never exceeded the budget", M.COUNTERS["max_inflight"] <= 16, f"peak={M.COUNTERS['max_inflight']}")
+    check("budget fully returned", idle_state(), f"free={dl._budget.free}/{dl._budget.total}")
+
+    # 15 --------------------------------------------------------------- saturated server answers Busy (-> HTTP 503)
+    dl._budget = dl._Budget(2); dl.STREAM_QUEUE_TIMEOUT = 1
+    streamer = dl.get_byte_streamer(multi_clients[0]); fid = await streamer.get_file_properties(1)
+    off, fpc, lpc, parts = dl.compute_geometry(0, 30 * CH, CH)
+    hog = dl.stream_file(0, fid, 1, off, fpc, lpc, parts, CH)
+    await hog.__anext__()                              # holds the whole 2-slot budget
+    t0 = time.time(); busy = False
+    try:
+        await get_stream(0, 5 * CH)
+    except dl.Busy:
+        busy = True
+    await hog.aclose()
+    dl.STREAM_QUEUE_TIMEOUT = 20
+    check("saturated server -> Busy after the queue timeout (HTTP 503), no hang", busy and time.time() - t0 < 3,
+          f"{time.time()-t0:.1f}s")
+    check("budget returned after hog closed", dl._budget.free == dl._budget.total)
 
     print("\n" + ("ALL TESTS PASSED" if failed == 0 else f"{failed} TEST(S) FAILED"))
     return failed
