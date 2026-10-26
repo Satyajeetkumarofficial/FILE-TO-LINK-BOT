@@ -20,7 +20,7 @@ from web.server import multi_clients, work_loads
 from web.server.exceptions import FIleNotFound, InvalidHash
 from database.users_db import db
 from web.utils.custom_dl import (
-    get_byte_streamer, stream_file, compute_geometry, active_streams, active_lanes,
+    Busy, get_byte_streamer, stream_file, compute_geometry, active_streams, active_lanes,
     pick_client_index, STATS,
 )
 from utils import get_readable_time
@@ -124,6 +124,8 @@ async def health_handler(_):
 @routes.get(r"/watch/{path:\S+}", allow_head=True)
 async def stream_watch_handler(request: web.Request):
     try:
+        if not multi_clients:
+            return web.Response(status=503, text="Bot is starting, retry in a few seconds")
         id, secure_hash = _parse_path(request)
         expired = await _check_expiry(id)
         if expired:
@@ -156,7 +158,11 @@ async def stream_handler(request: web.Request):
         raise web.HTTPForbidden(text=e.message)
     except FIleNotFound as e:
         raise web.HTTPNotFound(text=e.message)
-    except (AttributeError, BadStatusLine, ConnectionResetError):
+    except ConnectionResetError:
+        log.info("client disconnected: %s", request.path)
+        return web.Response(status=400, text="Client disconnected")
+    except (AttributeError, BadStatusLine):
+        log.exception("bad request / internal attribute error on %s", request.path)
         return web.Response(status=400, text="Bad Request")
     except Exception:
         log.exception("stream error")
@@ -284,6 +290,9 @@ async def media_streamer(request: web.Request, id: int, secure_hash: str):
             except (ConnectionResetError, asyncio.CancelledError):
                 # client went away - nothing to report
                 raise
+            except Busy:
+                return web.Response(status=503, text="Server is busy, please retry in a moment",
+                                    headers={"Retry-After": "10"})
             except Exception as e:
                 if request.transport is None or request.transport.is_closing():
                     return response            # client disconnected mid-stream
