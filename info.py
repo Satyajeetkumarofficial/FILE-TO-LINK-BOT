@@ -1,5 +1,6 @@
 from os import environ, getenv
 from Script import script
+from memguard import limit_mb as _limit_mb
 
 
 # ───────────────────────── safe env helpers ─────────────────────────
@@ -101,6 +102,18 @@ MULTI_CLIENT = True
 NAME = environ.get('name', 'ProBotz')
 
 
+
+# ───────────────────── memory-aware defaults ─────────────────────
+MEMORY_LIMIT_MB = _limit_mb()          # None = unknown / unlimited
+
+
+def _auto(small, mid, big):
+    """Pick a default by container size: <=640 MB / <=1.25 GB / bigger (unknown -> mid)."""
+    m = MEMORY_LIMIT_MB
+    if m is None:
+        return mid
+    return small if m <= 640 else (mid if m <= 1280 else big)
+
 # 🚀 __Streaming / Speed / Stability tuning__ (all optional, safe defaults)
 # GetFile requests kept in flight per worker. 4-6 is the sweet spot.
 PREFETCH_WINDOW = max(1, _env_int("PREFETCH_WINDOW", 5))
@@ -110,14 +123,14 @@ MAX_PARALLEL_CLIENTS = max(1, _env_int("MAX_PARALLEL_CLIENTS", 4))
 # Don't split tiny ranges across bots: every worker gets at least this many MB.
 MIN_PARTS_PER_WORKER = max(1, _env_int("MIN_PARTS_PER_WORKER", 4))
 # Hard cap on simultaneous open streams. Extra requests wait, then get 503.
-MAX_CONCURRENT_STREAMS = max(1, _env_int("MAX_CONCURRENT_STREAMS", 40))
+MAX_CONCURRENT_STREAMS = max(1, _env_int("MAX_CONCURRENT_STREAMS", _auto(12, 32, 100)))
 # Per-IP cap, 0 = off. Keep it OFF behind Cloudflare/proxies: all users share the same IPs.
 MAX_STREAMS_PER_IP = max(0, _env_int("MAX_STREAMS_PER_IP", 0))   # 0 = off
 # How long an over-limit request waits for a free slot before a 503.
 STREAM_QUEUE_TIMEOUT = max(1, _env_int("STREAM_QUEUE_TIMEOUT", 20))
 # HARD global cap on 1 MB chunks buffered/in flight across ALL streams (= max RAM for
 # streaming in MB). Every stream reserves its share first; if the pool is empty it waits.
-MAX_INFLIGHT_CHUNKS = max(8, _env_int("MAX_INFLIGHT_CHUNKS", 64))
+MAX_INFLIGHT_CHUNKS = max(8, _env_int("MAX_INFLIGHT_CHUNKS", _auto(16, 48, 128)))
 # A stream that gets no data from Telegram for this long is aborted (frees its slots).
 STALL_TIMEOUT = max(10, _env_int("STALL_TIMEOUT", 45))
 # One GetFile call: retries and per-attempt timeout (seconds).
@@ -131,6 +144,10 @@ MIN_REQUESTS_PER_CLIENT = max(1, _env_int("MIN_REQUESTS_PER_CLIENT", 3))
 FLOOD_BUDGET = max(5, _env_int("FLOOD_BUDGET", 90))
 # Longest FloodWait we are willing to sit out inside a stream (seconds).
 MAX_FLOOD_SLEEP = max(1, _env_int("MAX_FLOOD_SLEEP", 20))
+# Max bot clients (main + MULTI_TOKEN*). Every logged-in bot costs RAM; 0 = no limit.
+MAX_CLIENTS = max(0, _env_int("MAX_CLIENTS", _auto(3, 5, 0)))
+# Above this share of the memory limit new streams are refused with 503 (instead of an OOM kill).
+MEM_SHED_RATIO = max(0.5, min(0.98, _env_int("MEM_SHED_PERCENT", 85) / 100))
 # Cache of link-expiry setting / file records to spare MongoDB (seconds).
 SETTINGS_CACHE_TTL = max(1, _env_int("SETTINGS_CACHE_TTL", 30))
 # Max cached file properties per bot client.

@@ -22,14 +22,18 @@
 |---|---|---|
 | `PREFETCH_WINDOW` | 5 | GetFile requests in flight per bot (4-8) |
 | `MAX_PARALLEL_CLIENTS` | 4 | bots used for one stream when the server is idle |
-| `MAX_CONCURRENT_STREAMS` | 40 | open streams; extra users wait `STREAM_QUEUE_TIMEOUT`s then get 503 |
+| `MAX_CONCURRENT_STREAMS` | auto (512 MB: 12, 1 GB: 32, bigger: 100) | open streams; extra users wait `STREAM_QUEUE_TIMEOUT`s then get 503 |
 | `MAX_STREAMS_PER_IP` | 0 (off) | per-IP parallel connections; leave off behind Cloudflare/proxy |
 | `LOG_REQUESTS` | errors | `errors` = log only status>=400, `all`, or `off` |
-| `MAX_INFLIGHT_CHUNKS` | 64 | HARD RAM budget (MB) for stream buffers; streams wait/503 when it is used up |
+| `MAX_INFLIGHT_CHUNKS` | auto (512 MB: 16, 1 GB: 48, bigger: 128) | HARD RAM budget (MB) for stream buffers; streams wait/503 when it is used up |
 | `FETCH_RETRIES` / `FETCH_TIMEOUT` | 5 / 30 | per-chunk retries / seconds |
 | `MAX_REQUESTS_PER_CLIENT` | 16 | max parallel GetFile per bot; auto-shrinks on FloodWait, grows back slowly |
 | `MIN_REQUESTS_PER_CLIENT` | 3 | lowest value the limit may shrink to |
 | `FLOOD_BUDGET` | 90 | seconds a chunk may wait out FloodWaits before the stream is aborted |
+| `MAX_CLIENTS` | auto (512 MB: 3, 1 GB: 5, bigger: unlimited) | max bots (main + MULTI_TOKEN*); each logged-in bot costs RAM |
+| `MEM_SHED_PERCENT` | 85 | above this % of the RAM limit new streams get 503 instead of an OOM kill |
+| `MEMORY_LIMIT_MB` | auto | override the detected container RAM limit |
+| `STALL_TIMEOUT` | 45 | abort a stream that gets no data from Telegram for this long |
 | `WORKERS` | 50 | bot handler concurrency |
 
 Small host (512 MB, e.g. Koyeb free): keep the defaults and use only **2-3 extra bots** (each bot costs RAM).
@@ -43,3 +47,10 @@ the bot waits it out. Treat that collection like a password (anyone with it can 
 ## Testing
 - `python tests/test_engine.py` — engine test against a mock Telegram (correct bytes, ranges, errors, 80 users, disconnects, leaks).
 - `python speedtest.py "<your stream link>" -c 1 4 8 -s 100` — real MB/s on your deployment.
+
+## Memory (OOM) notes
+- Defaults are chosen from the container's RAM limit (cgroup) so a 512 MB host stays alive.
+- Streaming never keeps the file in RAM, only a few MB of 1 MB chunks, but each chunk is copied a few times while it is
+  decrypted/parsed, so the real cost is roughly 3-4x `MAX_INFLIGHT_CHUNKS`.
+- `/` shows `memory_mb` and `memory_limit_mb` so you can watch it live.
+- A front-end that opens 50+ parallel Range connections (e.g. a download-accelerator Worker) should be avoided on small hosts.
