@@ -23,7 +23,8 @@
 | `PREFETCH_WINDOW` | 5 | GetFile requests in flight per bot (4-8) |
 | `MAX_PARALLEL_CLIENTS` | 4 | bots used for one stream when the server is idle |
 | `MAX_CONCURRENT_STREAMS` | 100 | open streams; extra users wait `STREAM_QUEUE_TIMEOUT`s then get 503 |
-| `MAX_STREAMS_PER_IP` | 16 | per-IP parallel connections |
+| `MAX_STREAMS_PER_IP` | 0 (off) | per-IP parallel connections; leave off behind Cloudflare/proxy |
+| `LOG_REQUESTS` | errors | `errors` = log only status>=400, `all`, or `off` |
 | `MAX_INFLIGHT_CHUNKS` | 128 | approx. RAM budget in MB for buffers |
 | `FETCH_RETRIES` / `FETCH_TIMEOUT` | 5 / 30 | per-chunk retries / seconds |
 | `MAX_REQUESTS_PER_CLIENT` | 16 | max parallel GetFile per bot; auto-shrinks on FloodWait, grows back slowly |

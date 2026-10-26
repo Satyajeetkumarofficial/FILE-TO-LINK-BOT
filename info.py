@@ -111,8 +111,8 @@ MAX_PARALLEL_CLIENTS = max(1, _env_int("MAX_PARALLEL_CLIENTS", 4))
 MIN_PARTS_PER_WORKER = max(1, _env_int("MIN_PARTS_PER_WORKER", 4))
 # Hard cap on simultaneous open streams. Extra requests wait, then get 503.
 MAX_CONCURRENT_STREAMS = max(1, _env_int("MAX_CONCURRENT_STREAMS", 100))
-# Per-IP cap (download managers open many connections; 16 is generous).
-MAX_STREAMS_PER_IP = max(1, _env_int("MAX_STREAMS_PER_IP", 16))
+# Per-IP cap, 0 = off. Keep it OFF behind Cloudflare/proxies: all users share the same IPs.
+MAX_STREAMS_PER_IP = max(0, _env_int("MAX_STREAMS_PER_IP", 0))   # 0 = off
 # How long an over-limit request waits for a free slot before a 503.
 STREAM_QUEUE_TIMEOUT = max(1, _env_int("STREAM_QUEUE_TIMEOUT", 20))
 # Global cap on 1 MB chunks buffered/in flight across ALL streams (~= max RAM in MB).
