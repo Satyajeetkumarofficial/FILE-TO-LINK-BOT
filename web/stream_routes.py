@@ -13,6 +13,7 @@ from info import (
     BOT_USERNAME,
     MAX_CONCURRENT_STREAMS,
     MAX_STREAMS_PER_IP,
+    STALL_TIMEOUT,
     STREAM_QUEUE_TIMEOUT,
     SETTINGS_CACHE_TTL,
 )
@@ -279,7 +280,14 @@ async def media_streamer(request: web.Request, id: int, secure_hash: str):
                 async with aclosing(stream_file(
                     index, file_id, id, offset, first_part_cut, last_part_cut, part_count, CHUNK_SIZE
                 )) as gen:
-                    async for chunk in gen:
+                    it = gen.__aiter__()
+                    while True:
+                        try:
+                            chunk = await asyncio.wait_for(it.__anext__(), STALL_TIMEOUT)
+                        except StopAsyncIteration:
+                            break
+                        except asyncio.TimeoutError:
+                            raise ConnectionError(f"upstream stalled for {STALL_TIMEOUT}s")
                         if not prepared:
                             await response.prepare(request)
                             prepared = True
@@ -287,14 +295,18 @@ async def media_streamer(request: web.Request, id: int, secure_hash: str):
                         sent += len(chunk)
                 failure = None
                 break
-            except (ConnectionResetError, asyncio.CancelledError):
-                # client went away - nothing to report
+            except (ConnectionResetError, asyncio.CancelledError) as e:
+                # the client (or the proxy in front of us, e.g. a Cloudflare Worker) went away
+                log.info("peer closed after %.1f of %.1f MB (id=%s range=%s) via %s",
+                         sent / 1048576, req_length / 1048576, id, range_header or "-", type(e).__name__)
                 raise
             except Busy:
                 return web.Response(status=503, text="Server is busy, please retry in a moment",
                                     headers={"Retry-After": "10"})
             except Exception as e:
                 if request.transport is None or request.transport.is_closing():
+                    log.info("peer closed after %.1f of %.1f MB (id=%s) while writing: %r",
+                             sent / 1048576, req_length / 1048576, id, e)
                     return response            # client disconnected mid-stream
                 failure = e
                 if sent == 0 and attempt == 0:
