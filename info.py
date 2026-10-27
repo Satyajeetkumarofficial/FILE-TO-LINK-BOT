@@ -153,6 +153,26 @@ SETTINGS_CACHE_TTL = max(1, _env_int("SETTINGS_CACHE_TTL", 30))
 # Max cached file properties per bot client.
 FILE_CACHE_SIZE = max(100, _env_int("FILE_CACHE_SIZE", 5000))
 
+
+# 💾 __Disk cache__ (storage -> speed). Parts fetched from Telegram are kept in a sparse file, so a
+# second user / a seek back / a resume is served from local disk at full speed and Telegram (and its
+# FloodWait) is hit only once per part. Files bigger than the cache bypass it (direct streaming).
+DISK_CACHE_DIR = environ.get("DISK_CACHE_DIR", "/tmp/filecache")
+
+
+def _auto_cache_mb() -> int:
+    import shutil
+    try:
+        free = shutil.disk_usage("/tmp").free / 1048576
+    except Exception:
+        return 0
+    return int(min(free * 0.5, 4096)) if free >= 600 else 0
+
+
+DISK_CACHE_MB = max(0, _env_int("DISK_CACHE_MB", _auto_cache_mb()))      # 0 = off
+CACHE_READAHEAD = max(4, _env_int("CACHE_READAHEAD", 16))                # parts fetched ahead of the reader
+CACHE_MAX_RUNS = max(1, _env_int("CACHE_MAX_RUNS", 3))                   # parallel fill jobs per file
+
 # 🌐 __Web Server__
 ON_HEROKU = 'DYNO' in environ
 APP_NAME = environ.get('APP_NAME') if ON_HEROKU else None

@@ -1,5 +1,5 @@
 # NOTE: compat_pyrogram must be imported first - it makes `import pyrogram` work
-# whether the installed package exposes `pyrogram` or `wzgram`.
+# whether the installed package exposes `pyrogram` (Pyrofork) or `hydrogram`.
 import compat_pyrogram  # noqa: F401  (isort: skip)
 
 import asyncio
@@ -49,7 +49,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
-for _name in ("aiohttp", "aiohttp.web", "aiohttp.access", "pyrogram", "wzgram"):
+for _name in ("aiohttp", "aiohttp.web", "aiohttp.access", "pyrogram", "hydrogram", "wzgram"):
     logging.getLogger(_name).setLevel(logging.ERROR)
 
 from aiohttp import web                                   # noqa: E402
@@ -116,6 +116,11 @@ async def _login_main():
 
 async def start():
     print("\nInitializing Your Bot")
+    try:
+        import pyrogram as _lib
+        log.info("Telegram library: %s %s", compat_pyrogram.BACKEND, getattr(_lib, "__version__", "?"))
+    except Exception:
+        pass
 
     # web server FIRST: platform health checks pass while the bot logs in
     runner = web.AppRunner(await web_server(), access_log=None, keepalive_timeout=75)
